@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
+import { dbQuery } from '../../lib/db.js';
 import { AppError } from '../../lib/errors.js';
-import { getDb, getSignedReadUrl, uploadBufferToStorage } from '../../lib/firebase.js';
 import { assertNoSensitiveFinancialData, sanitizeText } from '../../lib/security.js';
 import { authenticate } from '../../middleware/auth.js';
 import { updateProfileSchema } from '../../schemas/auth.schema.js';
@@ -19,33 +19,32 @@ export async function profileRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const { id } = request.params;
-      const db = getDb();
-      const snap = await db.collection('profiles').doc(id).get();
+      const profRes = await dbQuery(
+        `SELECT id, full_name, avatar_file_id, bio, location_city, location_area, created_at
+         FROM profiles WHERE id = $1 AND is_suspended = FALSE`,
+        [id]
+      );
 
-      if (!snap.exists || snap.data()?.is_suspended) {
+      const profile = profRes.rows[0];
+      if (!profile) {
         throw new AppError(404, 'NOT_FOUND', 'Profile not found');
       }
 
-      const p = snap.data()!;
-      const avatarSignedUrl = p.avatar_url ? await getSignedReadUrl(String(p.avatar_url)) : null;
+      const countRes = await dbQuery<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM posts WHERE author_id = $1 AND status IN ('active', 'fulfilled')`,
+        [id]
+      );
 
-      const postsSnap = await db
-        .collection('posts')
-        .where('author_id', '==', id)
-        .where('status', 'in', ['active', 'fulfilled'])
-        .get();
+      const baseUrl = `${request.protocol}://${request.headers.host}`;
+      const avatarSignedUrl = profile.avatar_file_id
+        ? `${baseUrl}/api/v1/files/${profile.avatar_file_id}`
+        : null;
 
       return {
         profile: {
-          id: snap.id,
-          full_name: p.full_name,
-          avatar_url: p.avatar_url ?? null,
+          ...profile,
           avatar_signed_url: avatarSignedUrl,
-          bio: p.bio ?? null,
-          location_city: p.location_city ?? null,
-          location_area: p.location_area ?? null,
-          created_at: p.created_at,
-          public_posts_count: postsSnap.size,
+          public_posts_count: Number(countRes.rows[0]?.count ?? 0),
         },
       };
     }
@@ -63,26 +62,43 @@ export async function profileRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const userId = request.authUser!.id;
       const body = updateProfileSchema.parse(request.body);
-
       assertNoSensitiveFinancialData(body.bio, body.exact_address);
 
-      const db = getDb();
-      const now = new Date().toISOString();
-      const profileUpdate: Record<string, unknown> = { updated_at: now };
+      await dbQuery(
+        `UPDATE profiles
+         SET full_name = COALESCE($1, full_name),
+             bio = COALESCE($2, bio),
+             preferred_language = COALESCE($3, preferred_language),
+             location_city = COALESCE($4, location_city),
+             location_area = COALESCE($5, location_area),
+             updated_at = NOW()
+         WHERE id = $6`,
+        [
+          body.full_name !== undefined ? sanitizeText(body.full_name) : null,
+          body.bio !== undefined ? (body.bio ? sanitizeText(body.bio) : null) : null,
+          body.preferred_language ?? null,
+          body.location_city !== undefined ? (body.location_city ? sanitizeText(body.location_city) : null) : null,
+          body.location_area !== undefined ? (body.location_area ? sanitizeText(body.location_area) : null) : null,
+          userId,
+        ]
+      );
 
-      if (body.full_name !== undefined) profileUpdate.full_name = sanitizeText(body.full_name);
-      if (body.bio !== undefined) profileUpdate.bio = body.bio ? sanitizeText(body.bio) : null;
-      if (body.preferred_language !== undefined) profileUpdate.preferred_language = body.preferred_language;
-      if (body.location_city !== undefined) profileUpdate.location_city = body.location_city ? sanitizeText(body.location_city) : null;
-      if (body.location_area !== undefined) profileUpdate.location_area = body.location_area ? sanitizeText(body.location_area) : null;
+      if (body.phone !== undefined || body.exact_address !== undefined) {
+        await dbQuery(
+          `INSERT INTO profile_contacts (user_id, phone, exact_address)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (user_id) DO UPDATE
+           SET phone = COALESCE($2, profile_contacts.phone),
+               exact_address = COALESCE($3, profile_contacts.exact_address),
+               updated_at = NOW()`,
+          [
+            userId,
+            body.phone !== undefined ? (body.phone ? sanitizeText(body.phone) : null) : null,
+            body.exact_address !== undefined ? (body.exact_address ? sanitizeText(body.exact_address) : null) : null,
+          ]
+        );
+      }
 
-      await db.collection('profiles').doc(userId).set(profileUpdate, { merge: true });
-
-      const contactUpdate: Record<string, unknown> = { user_id: userId, updated_at: now };
-      if (body.phone !== undefined) contactUpdate.phone = body.phone ? sanitizeText(body.phone) : null;
-      if (body.exact_address !== undefined) contactUpdate.exact_address = body.exact_address ? sanitizeText(body.exact_address) : null;
-
-      await db.collection('profile_contacts').doc(userId).set(contactUpdate, { merge: true });
       return { success: true };
     }
   );
@@ -93,7 +109,7 @@ export async function profileRoutes(app: FastifyInstance): Promise<void> {
       preHandler: [authenticate],
       schema: {
         tags: ['Profiles'],
-        summary: 'Upload profile avatar photo to Firebase Storage',
+        summary: 'Upload profile avatar photo',
       },
     },
     async (request) => {
@@ -109,19 +125,23 @@ export async function profileRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, 'VALIDATION_ERROR', 'Avatar image must be 2MB or smaller');
       }
 
-      const ext = file.mimetype === 'image/png' ? 'png' : file.mimetype === 'image/webp' ? 'webp' : 'jpg';
-      const storagePath = `avatars/${userId}/avatar.${ext}`;
+      const blobRes = await dbQuery<{ id: string }>(
+        `INSERT INTO file_blobs (owner_id, bucket, file_name, mime_type, size_bytes, data)
+         VALUES ($1, 'avatars', $2, $3, $4, $5)
+         RETURNING id`,
+        [userId, file.filename || 'avatar', file.mimetype, buffer.length, buffer]
+      );
 
-      await uploadBufferToStorage(storagePath, buffer, file.mimetype);
-      await getDb().collection('profiles').doc(userId).update({
-        avatar_url: storagePath,
-        updated_at: new Date().toISOString(),
-      });
+      const fileId = blobRes.rows[0]!.id;
+      await dbQuery('UPDATE profiles SET avatar_file_id = $1, updated_at = NOW() WHERE id = $2', [
+        fileId,
+        userId,
+      ]);
 
-      const signedUrl = await getSignedReadUrl(storagePath);
+      const baseUrl = `${request.protocol}://${request.headers.host}`;
       return {
-        avatar_url: storagePath,
-        avatar_signed_url: signedUrl,
+        avatar_url: fileId,
+        avatar_signed_url: `${baseUrl}/api/v1/files/${fileId}`,
       };
     }
   );

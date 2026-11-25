@@ -1,30 +1,11 @@
+import bcrypt from 'bcryptjs';
 import type { FastifyInstance } from 'fastify';
-import { env, isFirebaseConfigured } from '../../config/env.js';
+import { isDatabaseConfigured } from '../../config/env.js';
+import { dbQuery, getPool } from '../../lib/db.js';
 import { AppError } from '../../lib/errors.js';
-import { getAdminAuth, getDb, getSignedReadUrl } from '../../lib/firebase.js';
 import { sanitizeText } from '../../lib/security.js';
-import { authenticate } from '../../middleware/auth.js';
+import { authenticate, signAuthToken } from '../../middleware/auth.js';
 import { loginSchema, registerSchema, resetPasswordSchema } from '../../schemas/auth.schema.js';
-
-async function firebaseIdentityToolkit(endpoint: string, payload: Record<string, unknown>) {
-  if (!env.FIREBASE_WEB_API_KEY) {
-    throw new AppError(503, 'SERVICE_UNAVAILABLE', 'FIREBASE_WEB_API_KEY is not configured');
-  }
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:${endpoint}?key=${env.FIREBASE_WEB_API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }
-  );
-  const data = (await res.json()) as Record<string, unknown>;
-  if (!res.ok) {
-    const errMsg = (data.error as { message?: string } | undefined)?.message || 'Authentication failed';
-    throw new AppError(400, 'BAD_REQUEST', errMsg);
-  }
-  return data;
-}
 
 export async function authRoutes(app: FastifyInstance): Promise<void> {
   app.post(
@@ -32,67 +13,65 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     {
       schema: {
         tags: ['Auth'],
-        summary: 'Register a new user account with Firebase Auth',
+        summary: 'Register a new user account',
       },
     },
     async (request, reply) => {
       const body = registerSchema.parse(request.body);
-      if (!isFirebaseConfigured()) {
-        throw new AppError(503, 'SERVICE_UNAVAILABLE', 'Firebase is not configured yet');
+      if (!isDatabaseConfigured()) {
+        throw new AppError(503, 'SERVICE_UNAVAILABLE', 'Database is not configured yet');
       }
+
       const email = body.email.toLowerCase();
       const fullName = sanitizeText(body.full_name);
+      const passwordHash = await bcrypt.hash(body.password, 10);
 
-      const result = await firebaseIdentityToolkit('signUp', {
-        email,
-        password: body.password,
-        returnSecureToken: true,
-      });
+      const existing = await dbQuery('SELECT id FROM users WHERE email = $1', [email]);
+      if (existing.rows.length > 0) {
+        throw new AppError(409, 'CONFLICT', 'An account with this email already exists');
+      }
 
-      const uid = String(result.localId);
-      const idToken = String(result.idToken);
-      const refreshToken = String(result.refreshToken);
-      const now = new Date().toISOString();
+      const client = await getPool().connect();
+      let userId: string;
+      try {
+        await client.query('BEGIN');
+        const userRes = await client.query<{ id: string }>(
+          'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id',
+          [email, passwordHash]
+        );
+        userId = userRes.rows[0]!.id;
 
-      await getAdminAuth().updateUser(uid, { displayName: fullName });
+        await client.query(
+          `INSERT INTO profiles (id, full_name, preferred_language)
+           VALUES ($1, $2, $3)`,
+          [userId, fullName, body.preferred_language]
+        );
 
-      const db = getDb();
-      await Promise.all([
-        db.collection('profiles').doc(uid).set({
-          id: uid,
-          full_name: fullName,
-          avatar_url: null,
-          bio: null,
-          role: 'user',
-          is_suspended: false,
-          suspended_reason: null,
-          preferred_language: body.preferred_language,
-          location_city: null,
-          location_area: null,
-          created_at: now,
-          updated_at: now,
-        }),
-        db.collection('profile_contacts').doc(uid).set({
-          user_id: uid,
-          email,
-          phone: null,
-          exact_address: null,
-          updated_at: now,
-        }),
-      ]);
+        await client.query(
+          `INSERT INTO profile_contacts (user_id, email)
+           VALUES ($1, $2)`,
+          [userId, email]
+        );
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
 
+      const token = signAuthToken(userId, email);
       return reply.status(201).send({
         user: {
-          id: uid,
+          id: userId,
           email,
           full_name: fullName,
           role: 'user',
           preferred_language: body.preferred_language,
         },
         session: {
-          access_token: idToken,
-          refresh_token: refreshToken,
-          expires_at: Number(result.expiresIn || 3600),
+          access_token: token,
+          expires_at: 7 * 24 * 3600,
         },
         requires_email_verification: false,
       });
@@ -104,39 +83,59 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     {
       schema: {
         tags: ['Auth'],
-        summary: 'Sign in with email and password via Firebase Auth',
+        summary: 'Sign in with email and password',
       },
     },
     async (request) => {
       const body = loginSchema.parse(request.body);
-      if (!isFirebaseConfigured()) {
-        throw new AppError(503, 'SERVICE_UNAVAILABLE', 'Firebase is not configured yet');
+      if (!isDatabaseConfigured()) {
+        throw new AppError(503, 'SERVICE_UNAVAILABLE', 'Database is not configured yet');
       }
-      const result = await firebaseIdentityToolkit('signInWithPassword', {
-        email: body.email.toLowerCase(),
-        password: body.password,
-        returnSecureToken: true,
-      });
 
-      const uid = String(result.localId);
-      const db = getDb();
-      const profileSnap = await db.collection('profiles').doc(uid).get();
-      const profile = profileSnap.data();
+      const email = body.email.toLowerCase();
+      const userRes = await dbQuery<{
+        id: string;
+        email: string;
+        password_hash: string;
+        full_name: string;
+        role: string;
+        is_suspended: boolean;
+        preferred_language: string;
+      }>(
+        `SELECT u.id, u.email, u.password_hash, p.full_name, p.role, p.is_suspended, p.preferred_language
+         FROM users u
+         JOIN profiles p ON p.id = u.id
+         WHERE u.email = $1`,
+        [email]
+      );
 
-      if (profile?.is_suspended) {
+      const user = userRes.rows[0];
+      if (!user) {
+        throw new AppError(401, 'UNAUTHORIZED', 'Invalid email or password');
+      }
+
+      const valid = await bcrypt.compare(body.password, user.password_hash);
+      if (!valid) {
+        throw new AppError(401, 'UNAUTHORIZED', 'Invalid email or password');
+      }
+
+      if (user.is_suspended) {
         throw new AppError(403, 'FORBIDDEN', 'Your account has been suspended');
       }
 
+      const token = signAuthToken(user.id, user.email);
       return {
         user: {
-          id: uid,
-          email: String(result.email || body.email.toLowerCase()),
-          ...profile,
+          id: user.id,
+          email: user.email,
+          full_name: user.full_name,
+          role: user.role,
+          is_suspended: user.is_suspended,
+          preferred_language: user.preferred_language,
         },
         session: {
-          access_token: String(result.idToken),
-          refresh_token: String(result.refreshToken),
-          expires_at: Number(result.expiresIn || 3600),
+          access_token: token,
+          expires_at: 7 * 24 * 3600,
         },
       };
     }
@@ -148,13 +147,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       preHandler: [authenticate],
       schema: {
         tags: ['Auth'],
-        summary: 'Revoke refresh tokens for current user',
+        summary: 'Sign out current session',
       },
     },
-    async (request) => {
-      await getAdminAuth().revokeRefreshTokens(request.authUser!.id);
-      return { success: true };
-    }
+    async () => ({ success: true })
   );
 
   app.post(
@@ -162,22 +158,14 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     {
       schema: {
         tags: ['Auth'],
-        summary: 'Send Firebase password reset email',
+        summary: 'Request password reset',
       },
     },
     async (request) => {
-      const body = resetPasswordSchema.parse(request.body);
-      if (!isFirebaseConfigured()) {
-        throw new AppError(503, 'SERVICE_UNAVAILABLE', 'Firebase is not configured yet');
-      }
-      await firebaseIdentityToolkit('sendOobCode', {
-        requestType: 'PASSWORD_RESET',
-        email: body.email.toLowerCase(),
-      });
-
+      resetPasswordSchema.parse(request.body);
       return {
         success: true,
-        message: 'If an account exists for that email, a password reset link has been sent.',
+        message: 'If an account exists for that email, a password reset instruction has been recorded.',
       };
     }
   );
@@ -193,33 +181,35 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const db = getDb();
-      const [profileSnap, contactSnap] = await Promise.all([
-        db.collection('profiles').doc(userId).get(),
-        db.collection('profile_contacts').doc(userId).get(),
+      const [profRes, contactRes] = await Promise.all([
+        dbQuery(
+          `SELECT id, full_name, avatar_file_id, bio, role, is_suspended, preferred_language, location_city, location_area, created_at
+           FROM profiles WHERE id = $1`,
+          [userId]
+        ),
+        dbQuery(
+          `SELECT email, phone, exact_address FROM profile_contacts WHERE user_id = $1`,
+          [userId]
+        ),
       ]);
 
-      const profile = profileSnap.data() ?? {};
-      const contacts = contactSnap.data() ?? {
+      const profile = profRes.rows[0] ?? {};
+      const contacts = contactRes.rows[0] ?? {
         email: request.authUser!.email,
         phone: null,
         exact_address: null,
       };
 
-      const avatarSignedUrl = profile.avatar_url
-        ? await getSignedReadUrl(String(profile.avatar_url))
+      const baseUrl = `${request.protocol}://${request.headers.host}`;
+      const avatarSignedUrl = profile.avatar_file_id
+        ? `${baseUrl}/api/v1/files/${profile.avatar_file_id}`
         : null;
 
       return {
         user: {
           ...profile,
-          id: userId,
           avatar_signed_url: avatarSignedUrl,
-          contacts: {
-            email: contacts.email ?? request.authUser!.email,
-            phone: contacts.phone ?? null,
-            exact_address: contacts.exact_address ?? null,
-          },
+          contacts,
         },
       };
     }

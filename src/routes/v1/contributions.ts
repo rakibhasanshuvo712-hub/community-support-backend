@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
+import { dbQuery } from '../../lib/db.js';
 import { AppError } from '../../lib/errors.js';
-import { getDb } from '../../lib/firebase.js';
 import { assertNoSensitiveFinancialData, sanitizeText } from '../../lib/security.js';
 import { authenticate } from '../../middleware/auth.js';
 import { createContributionSchema } from '../../schemas/interactions.schema.js';
@@ -20,14 +20,14 @@ export async function contributionRoutes(app: FastifyInstance): Promise<void> {
       const { postId } = request.params;
       const userId = request.authUser!.id;
       const body = createContributionSchema.parse(request.body);
-
       assertNoSensitiveFinancialData(body.note);
 
-      const db = getDb();
-      const postSnap = await db.collection('posts').doc(postId).get();
-      if (!postSnap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
-
-      const post = postSnap.data()!;
+      const postRes = await dbQuery<{ id: string; author_id: string; donation_type: string; status: string; title: string }>(
+        'SELECT id, author_id, donation_type, status, title FROM posts WHERE id = $1',
+        [postId]
+      );
+      const post = postRes.rows[0];
+      if (!post) throw new AppError(404, 'NOT_FOUND', 'Post not found');
       if (post.author_id === userId) {
         throw new AppError(400, 'BAD_REQUEST', 'You cannot pledge to your own post');
       }
@@ -38,34 +38,22 @@ export async function contributionRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, 'BAD_REQUEST', 'This post is no longer accepting pledges');
       }
 
-      const now = new Date().toISOString();
-      const ref = db.collection('contributions').doc();
-      const contribDoc = {
-        id: ref.id,
-        post_id: postId,
-        post_author_id: post.author_id,
-        contributor_id: userId,
-        amount: body.amount,
-        currency: body.currency.toUpperCase(),
-        note: body.note ? sanitizeText(body.note) : null,
-        status: 'pledged',
-        donor_confirmed: false,
-        recipient_confirmed: false,
-        confirmed_at: null,
-        created_at: now,
-        updated_at: now,
-      };
-      await ref.set(contribDoc);
+      const res = await dbQuery(
+        `INSERT INTO contributions (post_id, contributor_id, amount, currency, note, status)
+         VALUES ($1, $2, $3, $4, $5, 'pledged')
+         RETURNING *`,
+        [postId, userId, body.amount, body.currency.toUpperCase(), body.note ? sanitizeText(body.note) : null]
+      );
 
       await createNotification({
-        userId: String(post.author_id),
+        userId: post.author_id,
         type: 'new_offer',
         title: 'New monetary pledge',
         body: `${request.authUser!.full_name} pledged ${body.amount} ${body.currency.toUpperCase()} for "${post.title}". Coordinate direct transfer and confirm once received.`,
         link: `/posts/${postId}`,
       });
 
-      return reply.status(201).send({ contribution: contribDoc });
+      return reply.status(201).send({ contribution: res.rows[0] });
     }
   );
 
@@ -80,38 +68,32 @@ export async function contributionRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const db = getDb();
-
-      const [outgoingSnap, incomingSnap] = await Promise.all([
-        db.collection('contributions').where('contributor_id', '==', userId).orderBy('created_at', 'desc').get(),
-        db.collection('contributions').where('post_author_id', '==', userId).orderBy('created_at', 'desc').get(),
+      const [outRes, inRes] = await Promise.all([
+        dbQuery(
+          `SELECT c.*,
+                  json_build_object('id', p.id, 'title', p.title, 'currency', p.currency, 'status', p.status, 'author_id', p.author_id,
+                    'author', json_build_object('id', au.id, 'full_name', au.full_name)) AS post
+           FROM contributions c
+           JOIN posts p ON p.id = c.post_id
+           JOIN profiles au ON au.id = p.author_id
+           WHERE c.contributor_id = $1
+           ORDER BY c.created_at DESC`,
+          [userId]
+        ),
+        dbQuery(
+          `SELECT c.*,
+                  json_build_object('id', co.id, 'full_name', co.full_name) AS contributor,
+                  json_build_object('id', p.id, 'title', p.title, 'currency', p.currency, 'status', p.status) AS post
+           FROM contributions c
+           JOIN posts p ON p.id = c.post_id
+           JOIN profiles co ON co.id = c.contributor_id
+           WHERE p.author_id = $1
+           ORDER BY c.created_at DESC`,
+          [userId]
+        ),
       ]);
 
-      const hydrate = async (docs: FirebaseFirestore.QueryDocumentSnapshot[]) =>
-        Promise.all(
-          docs.map(async (d) => {
-            const c = d.data();
-            const [postSnap, contribSnap] = await Promise.all([
-              db.collection('posts').doc(String(c.post_id)).get(),
-              db.collection('profiles').doc(String(c.contributor_id)).get(),
-            ]);
-            return {
-              id: d.id,
-              ...c,
-              post: postSnap.exists ? { id: postSnap.id, ...postSnap.data() } : null,
-              contributor: contribSnap.exists
-                ? { id: contribSnap.id, full_name: contribSnap.data()?.full_name }
-                : null,
-            };
-          })
-        );
-
-      const [outgoing, incoming] = await Promise.all([
-        hydrate(outgoingSnap.docs),
-        hydrate(incomingSnap.docs),
-      ]);
-
-      return { outgoing, incoming };
+      return { outgoing: outRes.rows, incoming: inRes.rows };
     }
   );
 
@@ -127,55 +109,65 @@ export async function contributionRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
-      const db = getDb();
-      const ref = db.collection('contributions').doc(id);
-      const snap = await ref.get();
 
-      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'Contribution not found');
-      const contrib = snap.data()!;
+      const res = await dbQuery<{
+        post_id: string;
+        contributor_id: string;
+        status: string;
+        donor_confirmed: boolean;
+        recipient_confirmed: boolean;
+        author_id: string;
+        post_type: string;
+        title: string;
+      }>(
+        `SELECT c.*, p.author_id, p.post_type, p.title
+         FROM contributions c JOIN posts p ON p.id = c.post_id WHERE c.id = $1`,
+        [id]
+      );
+      const contrib = res.rows[0];
+      if (!contrib) throw new AppError(404, 'NOT_FOUND', 'Contribution not found');
       if (contrib.status !== 'pledged') {
         throw new AppError(409, 'CONFLICT', 'Only pledged contributions can be confirmed');
       }
 
-      const postSnap = await db.collection('posts').doc(String(contrib.post_id)).get();
-      const post = postSnap.data()!;
       const isContributor = contrib.contributor_id === userId;
-      const isPostOwner = post.author_id === userId;
-
+      const isPostOwner = contrib.author_id === userId;
       if (!isContributor && !isPostOwner) {
         throw new AppError(403, 'FORBIDDEN', 'You are not a participant in this contribution');
       }
 
       const isUserDonor =
-        (post.post_type === 'help_request' && isContributor) ||
-        (post.post_type === 'donation_offer' && isPostOwner);
+        (contrib.post_type === 'help_request' && isContributor) ||
+        (contrib.post_type === 'donation_offer' && isPostOwner);
 
-      const nextDonorConfirmed = isUserDonor ? true : Boolean(contrib.donor_confirmed);
-      const nextRecipientConfirmed = !isUserDonor ? true : Boolean(contrib.recipient_confirmed);
-      const bothConfirmed = nextDonorConfirmed && nextRecipientConfirmed;
-      const now = new Date().toISOString();
+      const nextDonor = isUserDonor ? true : contrib.donor_confirmed;
+      const nextRecipient = !isUserDonor ? true : contrib.recipient_confirmed;
+      const both = nextDonor && nextRecipient;
 
-      const updates = {
-        donor_confirmed: nextDonorConfirmed,
-        recipient_confirmed: nextRecipientConfirmed,
-        status: bothConfirmed ? 'confirmed' : 'pledged',
-        confirmed_at: bothConfirmed ? now : null,
-        updated_at: now,
-      };
-      await ref.update(updates);
+      const updated = await dbQuery(
+        `UPDATE contributions
+         SET donor_confirmed = $1,
+             recipient_confirmed = $2,
+             status = $3,
+             confirmed_at = $4,
+             updated_at = NOW()
+         WHERE id = $5
+         RETURNING *`,
+        [nextDonor, nextRecipient, both ? 'confirmed' : 'pledged', both ? new Date().toISOString() : null, id]
+      );
 
-      const otherUserId = isContributor ? String(post.author_id) : String(contrib.contributor_id);
+      const otherUserId = isContributor ? contrib.author_id : contrib.contributor_id;
       await createNotification({
         userId: otherUserId,
         type: 'contribution_confirmed',
-        title: bothConfirmed ? 'Direct transfer confirmed' : 'Transfer confirmation pending',
-        body: bothConfirmed
-          ? `Both parties confirmed the direct transfer for "${post.title}".`
-          : `The other party marked the direct transfer as complete for "${post.title}". Please confirm once verified.`,
+        title: both ? 'Direct transfer confirmed' : 'Transfer confirmation pending',
+        body: both
+          ? `Both parties confirmed the direct transfer for "${contrib.title}".`
+          : `The other party marked the direct transfer as complete for "${contrib.title}". Please confirm once verified.`,
         link: `/posts/${contrib.post_id}`,
       });
 
-      return { contribution: { id, ...contrib, ...updates } };
+      return { contribution: updated.rows[0] };
     }
   );
 
@@ -191,22 +183,26 @@ export async function contributionRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
-      const db = getDb();
-      const ref = db.collection('contributions').doc(id);
-      const snap = await ref.get();
 
-      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'Contribution not found');
-      const contrib = snap.data()!;
-      if (contrib.contributor_id !== userId && contrib.post_author_id !== userId) {
+      const res = await dbQuery<{ contributor_id: string; status: string; author_id: string }>(
+        `SELECT c.contributor_id, c.status, p.author_id
+         FROM contributions c JOIN posts p ON p.id = c.post_id WHERE c.id = $1`,
+        [id]
+      );
+      const contrib = res.rows[0];
+      if (!contrib) throw new AppError(404, 'NOT_FOUND', 'Contribution not found');
+      if (contrib.contributor_id !== userId && contrib.author_id !== userId) {
         throw new AppError(403, 'FORBIDDEN', 'Not authorized to cancel this pledge');
       }
       if (contrib.status !== 'pledged') {
         throw new AppError(409, 'CONFLICT', 'Only pledged contributions can be cancelled');
       }
 
-      const now = new Date().toISOString();
-      await ref.update({ status: 'cancelled', updated_at: now });
-      return { contribution: { id, ...contrib, status: 'cancelled', updated_at: now } };
+      const updated = await dbQuery(
+        `UPDATE contributions SET status = 'cancelled', updated_at = NOW() WHERE id = $1 RETURNING *`,
+        [id]
+      );
+      return { contribution: updated.rows[0] };
     }
   );
 }

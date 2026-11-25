@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
+import { dbQuery } from '../../lib/db.js';
 import { AppError } from '../../lib/errors.js';
-import { getAdminAuth, getDb } from '../../lib/firebase.js';
 import { sanitizeText } from '../../lib/security.js';
 import { requireAdmin } from '../../middleware/auth.js';
 import {
@@ -22,22 +22,21 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
-      const db = getDb();
       const [users, posts, claims, contributions, openReports] = await Promise.all([
-        db.collection('profiles').count().get(),
-        db.collection('posts').count().get(),
-        db.collection('claims').count().get(),
-        db.collection('contributions').count().get(),
-        db.collection('reports').where('status', '==', 'open').count().get(),
+        dbQuery<{ count: string }>('SELECT COUNT(*)::text AS count FROM profiles'),
+        dbQuery<{ count: string }>('SELECT COUNT(*)::text AS count FROM posts'),
+        dbQuery<{ count: string }>('SELECT COUNT(*)::text AS count FROM claims'),
+        dbQuery<{ count: string }>('SELECT COUNT(*)::text AS count FROM contributions'),
+        dbQuery<{ count: string }>(`SELECT COUNT(*)::text AS count FROM reports WHERE status = 'open'`),
       ]);
 
       return {
         stats: {
-          total_users: users.data().count,
-          total_posts: posts.data().count,
-          total_claims: claims.data().count,
-          total_contributions: contributions.data().count,
-          open_reports: openReports.data().count,
+          total_users: Number(users.rows[0]?.count ?? 0),
+          total_posts: Number(posts.rows[0]?.count ?? 0),
+          total_claims: Number(claims.rows[0]?.count ?? 0),
+          total_contributions: Number(contributions.rows[0]?.count ?? 0),
+          open_reports: Number(openReports.rows[0]?.count ?? 0),
         },
       };
     }
@@ -52,8 +51,10 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
-      const snap = await getDb().collection('profiles').orderBy('created_at', 'desc').limit(100).get();
-      return { users: snap.docs.map((d) => ({ id: d.id, ...d.data() })) };
+      const res = await dbQuery(
+        'SELECT id, full_name, role, is_suspended, suspended_reason, location_city, created_at FROM profiles ORDER BY created_at DESC LIMIT 100'
+      );
+      return { users: res.rows };
     }
   );
 
@@ -74,36 +75,24 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, 'BAD_REQUEST', 'You cannot ban your own admin account');
       }
 
-      const db = getDb();
-      const ref = db.collection('profiles').doc(id);
-      const snap = await ref.get();
-      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'User not found');
+      const res = await dbQuery(
+        `UPDATE profiles
+         SET is_suspended = $1,
+             suspended_reason = $2,
+             updated_at = NOW()
+         WHERE id = $3
+         RETURNING *`,
+        [body.is_suspended, body.is_suspended ? sanitizeText(body.reason) : null, id]
+      );
+      if (!res.rows[0]) throw new AppError(404, 'NOT_FOUND', 'User not found');
 
-      const now = new Date().toISOString();
-      const updates = {
-        is_suspended: body.is_suspended,
-        suspended_reason: body.is_suspended ? sanitizeText(body.reason) : null,
-        updated_at: now,
-      };
-      await ref.update(updates);
+      await dbQuery(
+        `INSERT INTO moderation_actions (admin_id, action_type, target_user_id, reason)
+         VALUES ($1, $2, $3, $4)`,
+        [adminId, body.is_suspended ? 'suspend_user' : 'unsuspend_user', id, sanitizeText(body.reason)]
+      );
 
-      if (body.is_suspended) {
-        try {
-          await getAdminAuth().revokeRefreshTokens(id);
-        } catch {
-          // Ignore if auth user was already deleted
-        }
-      }
-
-      await db.collection('moderation_actions').add({
-        admin_id: adminId,
-        action_type: body.is_suspended ? 'suspend_user' : 'unsuspend_user',
-        target_user_id: id,
-        reason: sanitizeText(body.reason),
-        created_at: now,
-      });
-
-      return { user: { id, ...snap.data(), ...updates } };
+      return { user: res.rows[0] };
     }
   );
 
@@ -116,8 +105,15 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
-      const snap = await getDb().collection('posts').orderBy('created_at', 'desc').limit(100).get();
-      return { posts: snap.docs.map((d) => ({ id: d.id, ...d.data() })) };
+      const res = await dbQuery(
+        `SELECT p.id, p.title, p.post_type, p.donation_type, p.status, p.urgency, p.location_city, p.created_at,
+                json_build_object('id', pr.id, 'full_name', pr.full_name, 'is_suspended', pr.is_suspended) AS author
+         FROM posts p
+         JOIN profiles pr ON pr.id = p.author_id
+         ORDER BY p.created_at DESC
+         LIMIT 100`
+      );
+      return { posts: res.rows };
     }
   );
 
@@ -134,32 +130,28 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       const adminId = request.authUser!.id;
       const body = adminPostStatusSchema.parse(request.body);
 
-      const db = getDb();
-      const ref = db.collection('posts').doc(id);
-      const snap = await ref.get();
-      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
+      const res = await dbQuery<{ id: string; author_id: string; title: string; status: string }>(
+        'UPDATE posts SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
+        [body.status, id]
+      );
+      const updated = res.rows[0];
+      if (!updated) throw new AppError(404, 'NOT_FOUND', 'Post not found');
 
-      const existing = snap.data()!;
-      const now = new Date().toISOString();
-      await ref.update({ status: body.status, updated_at: now });
-
-      await db.collection('moderation_actions').add({
-        admin_id: adminId,
-        action_type: body.status === 'removed' ? 'remove_post' : 'restore_post',
-        target_post_id: id,
-        reason: sanitizeText(body.reason),
-        created_at: now,
-      });
+      await dbQuery(
+        `INSERT INTO moderation_actions (admin_id, action_type, target_post_id, reason)
+         VALUES ($1, $2, $3, $4)`,
+        [adminId, body.status === 'removed' ? 'remove_post' : 'restore_post', id, sanitizeText(body.reason)]
+      );
 
       await createNotification({
-        userId: String(existing.author_id),
+        userId: updated.author_id,
         type: 'moderation',
         title: 'Post moderation update',
-        body: `Your post "${existing.title}" status was updated to ${body.status}: ${sanitizeText(body.reason)}`,
+        body: `Your post "${updated.title}" status was updated to ${body.status}: ${sanitizeText(body.reason)}`,
         link: `/posts/${id}`,
       });
 
-      return { post: { id, ...existing, status: body.status, updated_at: now } };
+      return { post: updated };
     }
   );
 
@@ -174,33 +166,28 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const adminId = request.authUser!.id;
-      const db = getDb();
-      const ref = db.collection('posts').doc(id);
-      const snap = await ref.get();
 
-      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
-      const existing = snap.data()!;
-      const now = new Date().toISOString();
+      const existingRes = await dbQuery<{ id: string; author_id: string; title: string }>(
+        'SELECT id, author_id, title FROM posts WHERE id = $1',
+        [id]
+      );
+      const existing = existingRes.rows[0];
+      if (!existing) throw new AppError(404, 'NOT_FOUND', 'Post not found');
 
-      await ref.delete();
+      await dbQuery('DELETE FROM posts WHERE id = $1', [id]);
 
-      await db.collection('moderation_actions').add({
-        admin_id: adminId,
-        action_type: 'remove_post',
-        target_post_id: id,
-        target_user_id: existing.author_id ?? null,
-        reason: `Deleted post "${existing.title}"`,
-        created_at: now,
+      await dbQuery(
+        `INSERT INTO moderation_actions (admin_id, action_type, target_post_id, target_user_id, reason)
+         VALUES ($1, 'remove_post', $2, $3, $4)`,
+        [adminId, id, existing.author_id, `Deleted post "${existing.title}"`]
+      );
+
+      await createNotification({
+        userId: existing.author_id,
+        type: 'moderation',
+        title: 'Post deleted by administrator',
+        body: `Your post "${existing.title}" was deleted by an administrator.`,
       });
-
-      if (existing.author_id) {
-        await createNotification({
-          userId: String(existing.author_id),
-          type: 'moderation',
-          title: 'Post deleted by administrator',
-          body: `Your post "${existing.title}" was deleted by an administrator.`,
-        });
-      }
 
       return { success: true };
     }
@@ -215,28 +202,19 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
-      const db = getDb();
-      const snap = await db.collection('reports').orderBy('created_at', 'desc').limit(100).get();
-
-      const reports = await Promise.all(
-        snap.docs.map(async (d) => {
-          const r = d.data();
-          const [reporterSnap, targetUserSnap, targetPostSnap] = await Promise.all([
-            r.reporter_id ? db.collection('profiles').doc(String(r.reporter_id)).get() : Promise.resolve(null),
-            r.target_user_id ? db.collection('profiles').doc(String(r.target_user_id)).get() : Promise.resolve(null),
-            r.target_post_id ? db.collection('posts').doc(String(r.target_post_id)).get() : Promise.resolve(null),
-          ]);
-          return {
-            id: d.id,
-            ...r,
-            reporter_name: reporterSnap?.exists ? reporterSnap.data()?.full_name : 'Unknown',
-            target_user_name: targetUserSnap?.exists ? targetUserSnap.data()?.full_name : null,
-            target_post_title: targetPostSnap?.exists ? targetPostSnap.data()?.title : null,
-          };
-        })
+      const res = await dbQuery(
+        `SELECT r.*,
+                rp.full_name AS reporter_name,
+                tu.full_name AS target_user_name,
+                p.title AS target_post_title
+         FROM reports r
+         LEFT JOIN profiles rp ON rp.id = r.reporter_id
+         LEFT JOIN profiles tu ON tu.id = r.target_user_id
+         LEFT JOIN posts p ON p.id = r.target_post_id
+         ORDER BY r.created_at DESC
+         LIMIT 100`
       );
-
-      return { reports };
+      return { reports: res.rows };
     }
   );
 
@@ -253,42 +231,36 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       const adminId = request.authUser!.id;
       const body = adminResolveReportSchema.parse(request.body);
 
-      const db = getDb();
-      const ref = db.collection('reports').doc(id);
-      const snap = await ref.get();
-      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'Report not found');
-
-      const existing = snap.data()!;
-      const now = new Date().toISOString();
-      const updates = {
-        status: body.status,
-        resolution_note: sanitizeText(body.reason),
-        resolved_by: adminId,
-        resolved_at: body.status === 'reviewing' ? null : now,
-      };
-      await ref.update(updates);
+      const res = await dbQuery<{ id: string; reporter_id: string; reason: string; status: string }>(
+        `UPDATE reports
+         SET status = $1,
+             resolution_note = $2,
+             resolved_by = $3,
+             resolved_at = CASE WHEN $1 = 'reviewing' THEN NULL ELSE NOW() END
+         WHERE id = $4
+         RETURNING *`,
+        [body.status, sanitizeText(body.reason), adminId, id]
+      );
+      const updated = res.rows[0];
+      if (!updated) throw new AppError(404, 'NOT_FOUND', 'Report not found');
 
       if (body.status === 'resolved' || body.status === 'dismissed') {
-        await db.collection('moderation_actions').add({
-          admin_id: adminId,
-          action_type: body.status === 'resolved' ? 'resolve_report' : 'dismiss_report',
-          report_id: id,
-          reason: sanitizeText(body.reason),
-          created_at: now,
-        });
+        await dbQuery(
+          `INSERT INTO moderation_actions (admin_id, action_type, report_id, reason)
+           VALUES ($1, $2, $3, $4)`,
+          [adminId, body.status === 'resolved' ? 'resolve_report' : 'dismiss_report', id, sanitizeText(body.reason)]
+        );
 
-        if (existing.reporter_id) {
-          await createNotification({
-            userId: String(existing.reporter_id),
-            type: 'moderation',
-            title: `Dispute ${body.status}`,
-            body: `Your complaint ("${existing.reason}") was marked ${body.status}: ${sanitizeText(body.reason)}`,
-            link: '/dashboard',
-          });
-        }
+        await createNotification({
+          userId: updated.reporter_id,
+          type: 'moderation',
+          title: `Dispute ${body.status}`,
+          body: `Your complaint ("${updated.reason}") was marked ${body.status}: ${sanitizeText(body.reason)}`,
+          link: '/dashboard',
+        });
       }
 
-      return { report: { id, ...existing, ...updates } };
+      return { report: updated };
     }
   );
 
@@ -301,12 +273,8 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
-      const snap = await getDb()
-        .collection('moderation_actions')
-        .orderBy('created_at', 'desc')
-        .limit(50)
-        .get();
-      return { actions: snap.docs.map((d) => ({ id: d.id, ...d.data() })) };
+      const res = await dbQuery('SELECT * FROM moderation_actions ORDER BY created_at DESC LIMIT 50');
+      return { actions: res.rows };
     }
   );
 }

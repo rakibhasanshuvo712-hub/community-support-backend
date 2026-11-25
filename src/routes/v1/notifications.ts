@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { getDb } from '../../lib/firebase.js';
+import { dbQuery } from '../../lib/db.js';
 import { authenticate } from '../../middleware/auth.js';
 
 export async function notificationRoutes(app: FastifyInstance): Promise<void> {
@@ -14,17 +14,12 @@ export async function notificationRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const snap = await getDb()
-        .collection('notifications')
-        .where('user_id', '==', userId)
-        .orderBy('created_at', 'desc')
-        .limit(50)
-        .get();
-
-      const notifications = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Record<string, unknown>));
-      const unreadCount = notifications.filter((n) => !n.is_read).length;
-
-      return { notifications, unread_count: unreadCount };
+      const res = await dbQuery<{ is_read: boolean }>(
+        'SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
+        [userId]
+      );
+      const unreadCount = res.rows.filter((n) => !n.is_read).length;
+      return { notifications: res.rows, unread_count: unreadCount };
     }
   );
 
@@ -40,12 +35,7 @@ export async function notificationRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
-      const ref = getDb().collection('notifications').doc(id);
-      const snap = await ref.get();
-
-      if (snap.exists && snap.data()?.user_id === userId) {
-        await ref.update({ is_read: true });
-      }
+      await dbQuery('UPDATE notifications SET is_read = TRUE WHERE id = $1 AND user_id = $2', [id, userId]);
       return { success: true };
     }
   );
@@ -61,21 +51,7 @@ export async function notificationRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const db = getDb();
-      const snap = await db
-        .collection('notifications')
-        .where('user_id', '==', userId)
-        .where('is_read', '==', false)
-        .get();
-
-      if (!snap.empty) {
-        const batch = db.batch();
-        for (const d of snap.docs) {
-          batch.update(d.ref, { is_read: true });
-        }
-        await batch.commit();
-      }
-
+      await dbQuery('UPDATE notifications SET is_read = TRUE WHERE user_id = $1 AND is_read = FALSE', [userId]);
       return { success: true };
     }
   );

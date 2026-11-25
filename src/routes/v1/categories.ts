@@ -1,7 +1,6 @@
 import type { FastifyInstance } from 'fastify';
-import { isFirebaseConfigured } from '../../config/env.js';
-import { getDb } from '../../lib/firebase.js';
-import { DEFAULT_CATEGORIES, ensureCategoriesSeeded } from '../../services/seed.service.js';
+import { isDatabaseConfigured } from '../../config/env.js';
+import { dbQuery, DEFAULT_CATEGORIES } from '../../lib/db.js';
 
 export async function categoryRoutes(app: FastifyInstance): Promise<void> {
   app.get(
@@ -13,14 +12,11 @@ export async function categoryRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
-      if (!isFirebaseConfigured()) {
+      if (!isDatabaseConfigured()) {
         return { categories: DEFAULT_CATEGORIES };
       }
-
-      await ensureCategoriesSeeded();
-      const snap = await getDb().collection('categories').orderBy('sort_order', 'asc').get();
-      const categories = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      return { categories };
+      const res = await dbQuery('SELECT * FROM categories ORDER BY sort_order ASC');
+      return { categories: res.rows };
     }
   );
 }

@@ -1,39 +1,20 @@
 import type { FastifyInstance } from 'fastify';
-import { isFirebaseConfigured } from '../../config/env.js';
+import { isDatabaseConfigured } from '../../config/env.js';
+import { dbQuery } from '../../lib/db.js';
 import { AppError } from '../../lib/errors.js';
-import { getDb, getSignedReadUrl, uploadBufferToStorage } from '../../lib/firebase.js';
 import { assertNoSensitiveFinancialData, sanitizeText } from '../../lib/security.js';
-import { authenticate, optionalAuth } from '../../middleware/auth.js';
+import { authenticate, optionalAuth, signFileToken } from '../../middleware/auth.js';
 import {
   createPostSchema,
   listPostsQuerySchema,
   updatePostSchema,
 } from '../../schemas/posts.schema.js';
 import { createNotification } from '../../services/notifications.service.js';
-import { ensureCategoriesSeeded } from '../../services/seed.service.js';
 
 const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const ALLOWED_DOC_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png', 'image/webp']);
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_DOC_BYTES = 10 * 1024 * 1024;
-
-interface StoredImage {
-  id: string;
-  storage_path: string;
-  sort_order: number;
-}
-
-async function signPostImages(images: StoredImage[]) {
-  if (!images || images.length === 0) return [];
-  const signed = await Promise.all(
-    images.map(async (img) => ({
-      id: img.id,
-      sort_order: img.sort_order,
-      url: await getSignedReadUrl(img.storage_path),
-    }))
-  );
-  return signed.sort((a, b) => a.sort_order - b.sort_order);
-}
 
 async function isAuthorizedForPrivatePostDetails(
   postId: string,
@@ -44,25 +25,18 @@ async function isAuthorizedForPrivatePostDetails(
   if (!userId) return false;
   if (userId === authorId || role === 'admin') return true;
 
-  const db = getDb();
-  const [claimsSnap, contribSnap] = await Promise.all([
-    db
-      .collection('claims')
-      .where('post_id', '==', postId)
-      .where('claimant_id', '==', userId)
-      .where('status', 'in', ['accepted', 'completed'])
-      .limit(1)
-      .get(),
-    db
-      .collection('contributions')
-      .where('post_id', '==', postId)
-      .where('contributor_id', '==', userId)
-      .where('status', 'in', ['pledged', 'confirmed'])
-      .limit(1)
-      .get(),
+  const [claimsRes, contribRes] = await Promise.all([
+    dbQuery(
+      `SELECT id FROM claims WHERE post_id = $1 AND claimant_id = $2 AND status IN ('accepted', 'completed') LIMIT 1`,
+      [postId, userId]
+    ),
+    dbQuery(
+      `SELECT id FROM contributions WHERE post_id = $1 AND contributor_id = $2 AND status IN ('pledged', 'confirmed') LIMIT 1`,
+      [postId, userId]
+    ),
   ]);
 
-  return !claimsSnap.empty || !contribSnap.empty;
+  return claimsRes.rows.length > 0 || contribRes.rows.length > 0;
 }
 
 export async function postRoutes(app: FastifyInstance): Promise<void> {
@@ -76,66 +50,104 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async (request) => {
-      if (!isFirebaseConfigured()) {
+      if (!isDatabaseConfigured()) {
         return {
           posts: [],
           pagination: { page: 1, limit: 12, total: 0, total_pages: 0 },
         };
       }
 
-      await ensureCategoriesSeeded();
       const query = listPostsQuerySchema.parse(request.query);
-      const db = getDb();
+      const conditions: string[] = [];
+      const params: unknown[] = [];
 
-      const snap = await db
-        .collection('posts')
-        .where('status', 'in', query.status ? [query.status] : ['active', 'fulfilled'])
-        .orderBy('created_at', 'desc')
-        .limit(200)
-        .get();
+      if (query.status) {
+        params.push(query.status);
+        conditions.push(`p.status = $${params.length}`);
+      } else {
+        conditions.push(`p.status IN ('active', 'fulfilled')`);
+      }
 
-      let items = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Record<string, unknown>));
-
-      if (query.post_type) items = items.filter((p) => p.post_type === query.post_type);
-      if (query.donation_type) items = items.filter((p) => p.donation_type === query.donation_type);
-      if (query.urgency) items = items.filter((p) => p.urgency === query.urgency);
-      if (query.category_id) items = items.filter((p) => p.category_id === query.category_id);
-      if (query.category_slug) items = items.filter((p) => p.category_id === query.category_slug);
+      if (query.post_type) {
+        params.push(query.post_type);
+        conditions.push(`p.post_type = $${params.length}`);
+      }
+      if (query.donation_type) {
+        params.push(query.donation_type);
+        conditions.push(`p.donation_type = $${params.length}`);
+      }
+      if (query.urgency) {
+        params.push(query.urgency);
+        conditions.push(`p.urgency = $${params.length}`);
+      }
+      if (query.category_id) {
+        params.push(query.category_id);
+        conditions.push(`p.category_id = $${params.length}`);
+      }
+      if (query.category_slug) {
+        params.push(query.category_slug);
+        conditions.push(`c.slug = $${params.length}`);
+      }
       if (query.city) {
-        const c = query.city.toLowerCase();
-        items = items.filter((p) => String(p.location_city || '').toLowerCase().includes(c));
+        params.push(`%${query.city}%`);
+        conditions.push(`p.location_city ILIKE $${params.length}`);
       }
       if (query.q) {
-        const qLower = query.q.toLowerCase();
-        items = items.filter(
-          (p) =>
-            String(p.title || '').toLowerCase().includes(qLower) ||
-            String(p.description || '').toLowerCase().includes(qLower) ||
-            String(p.location_city || '').toLowerCase().includes(qLower)
+        params.push(`%${query.q}%`);
+        conditions.push(
+          `(p.title ILIKE $${params.length} OR p.description ILIKE $${params.length} OR p.location_city ILIKE $${params.length})`
         );
       }
 
-      if (query.sort === 'urgent') {
-        const rank: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
-        items.sort((a, b) => (rank[String(a.urgency)] ?? 9) - (rank[String(b.urgency)] ?? 9));
-      } else if (query.sort === 'relevant') {
-        items.sort((a, b) => Number(b.view_count || 0) - Number(a.view_count || 0));
-      }
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+      const orderClause =
+        query.sort === 'urgent'
+          ? `ORDER BY CASE p.urgency WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END ASC, p.created_at DESC`
+          : query.sort === 'relevant'
+            ? `ORDER BY p.view_count DESC, p.created_at DESC`
+            : `ORDER BY p.created_at DESC`;
 
-      const total = items.length;
-      const start = (query.page - 1) * query.limit;
-      const paged = items.slice(start, start + query.limit);
-
-      const catSnap = await db.collection('categories').get();
-      const catMap = new Map(catSnap.docs.map((c) => [c.id, { id: c.id, ...c.data() }]));
-
-      const posts = await Promise.all(
-        paged.map(async (post) => ({
-          ...post,
-          category: catMap.get(String(post.category_id)) ?? null,
-          images: await signPostImages((post.images as StoredImage[]) ?? []),
-        }))
+      const countRes = await dbQuery<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM posts p JOIN categories c ON c.id = p.category_id ${whereClause}`,
+        params
       );
+      const total = Number(countRes.rows[0]?.count ?? 0);
+
+      const offset = (query.page - 1) * query.limit;
+      const listParams = [...params, query.limit, offset];
+
+      const listRes = await dbQuery(
+        `SELECT p.*,
+                json_build_object('id', pr.id, 'full_name', pr.full_name, 'location_city', pr.location_city) AS author,
+                json_build_object('id', c.id, 'slug', c.slug, 'name_en', c.name_en, 'name_bn', c.name_bn, 'icon', c.icon, 'is_restricted', c.is_restricted) AS category,
+                COALESCE(
+                  (SELECT json_agg(json_build_object('id', pi.id, 'file_id', pi.file_id, 'sort_order', pi.sort_order) ORDER BY pi.sort_order ASC)
+                   FROM post_images pi WHERE pi.post_id = p.id),
+                  '[]'::json
+                ) AS raw_images
+         FROM posts p
+         JOIN profiles pr ON pr.id = p.author_id
+         JOIN categories c ON c.id = p.category_id
+         ${whereClause}
+         ${orderClause}
+         LIMIT $${listParams.length - 1} OFFSET $${listParams.length}`,
+        listParams
+      );
+
+      const baseUrl = `${request.protocol}://${request.headers.host}`;
+      const posts = listRes.rows.map((row) => {
+        const rawImages = (row.raw_images as Array<{ id: string; file_id: string; sort_order: number }>) ?? [];
+        const rest = { ...row };
+        delete rest.raw_images;
+        return {
+          ...rest,
+          images: rawImages.map((img) => ({
+            id: img.id,
+            sort_order: img.sort_order,
+            url: `${baseUrl}/api/v1/files/${img.file_id}`,
+          })),
+        };
+      });
 
       return {
         posts,
@@ -160,28 +172,16 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const db = getDb();
-      const snap = await db
-        .collection('posts')
-        .where('author_id', '==', userId)
-        .orderBy('created_at', 'desc')
-        .get();
-
-      const catSnap = await db.collection('categories').get();
-      const catMap = new Map(catSnap.docs.map((c) => [c.id, { id: c.id, ...c.data() }]));
-
-      const posts = await Promise.all(
-        snap.docs
-          .map((d) => ({ id: d.id, ...d.data() } as Record<string, unknown>))
-          .filter((p) => p.status !== 'removed')
-          .map(async (post) => ({
-            ...post,
-            category: catMap.get(String(post.category_id)) ?? null,
-            images: await signPostImages((post.images as StoredImage[]) ?? []),
-          }))
+      const res = await dbQuery(
+        `SELECT p.*,
+                json_build_object('id', c.id, 'slug', c.slug, 'name_en', c.name_en, 'name_bn', c.name_bn, 'icon', c.icon, 'is_restricted', c.is_restricted) AS category
+         FROM posts p
+         JOIN categories c ON c.id = p.category_id
+         WHERE p.author_id = $1 AND p.status <> 'removed'
+         ORDER BY p.created_at DESC`,
+        [userId]
       );
-
-      return { posts };
+      return { posts: res.rows };
     }
   );
 
@@ -205,14 +205,14 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         body.contact_note
       );
 
-      await ensureCategoriesSeeded();
-      const db = getDb();
-      const catSnap = await db.collection('categories').doc(body.category_id).get();
-      if (!catSnap.exists) {
+      const catRes = await dbQuery<{ id: string; is_restricted: boolean }>(
+        'SELECT id, is_restricted FROM categories WHERE id = $1',
+        [body.category_id]
+      );
+      const category = catRes.rows[0];
+      if (!category) {
         throw new AppError(400, 'VALIDATION_ERROR', 'Invalid category selected');
       }
-
-      const category = catSnap.data()!;
       if (category.is_restricted && !body.safety_acknowledged) {
         throw new AppError(
           400,
@@ -220,54 +220,51 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
           'You must acknowledge the medicine safety guidelines before publishing in this category.'
         );
       }
-
       if (body.donation_type === 'money' && !body.amount) {
         throw new AppError(400, 'VALIDATION_ERROR', 'Target or offered amount is required for monetary posts');
       }
 
-      const now = new Date().toISOString();
-      const postRef = db.collection('posts').doc();
-      const postDoc = {
-        id: postRef.id,
-        author_id: userId,
-        author: {
-          id: userId,
-          full_name: request.authUser!.full_name,
-        },
-        post_type: body.post_type,
-        donation_type: body.donation_type,
-        category_id: body.category_id,
-        title: sanitizeText(body.title),
-        description: sanitizeText(body.description),
-        quantity: body.quantity ?? null,
-        unit: body.unit ? sanitizeText(body.unit) : null,
-        amount: body.amount ?? null,
-        currency: body.currency.toUpperCase(),
-        location_city: sanitizeText(body.location_city),
-        location_area: body.location_area ? sanitizeText(body.location_area) : null,
-        urgency: body.urgency,
-        status: 'active',
-        safety_acknowledged: body.safety_acknowledged,
-        expires_at: body.expires_at ?? null,
-        view_count: 0,
-        images: [],
-        created_at: now,
-        updated_at: now,
-      };
+      const insertRes = await dbQuery<{ id: string }>(
+        `INSERT INTO posts (
+          author_id, post_type, donation_type, category_id, title, description,
+          quantity, unit, amount, currency, location_city, location_area,
+          urgency, status, safety_acknowledged, expires_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'active',$14,$15)
+        RETURNING *`,
+        [
+          userId,
+          body.post_type,
+          body.donation_type,
+          body.category_id,
+          sanitizeText(body.title),
+          sanitizeText(body.description),
+          body.quantity ?? null,
+          body.unit ? sanitizeText(body.unit) : null,
+          body.amount ?? null,
+          body.currency.toUpperCase(),
+          sanitizeText(body.location_city),
+          body.location_area ? sanitizeText(body.location_area) : null,
+          body.urgency,
+          body.safety_acknowledged,
+          body.expires_at ?? null,
+        ]
+      );
 
-      await postRef.set(postDoc);
-
+      const post = insertRes.rows[0]!;
       if (body.exact_handover_address || body.contact_phone || body.contact_note) {
-        await db.collection('post_private_details').doc(postRef.id).set({
-          post_id: postRef.id,
-          exact_handover_address: body.exact_handover_address ? sanitizeText(body.exact_handover_address) : null,
-          contact_phone: body.contact_phone ? sanitizeText(body.contact_phone) : null,
-          contact_note: body.contact_note ? sanitizeText(body.contact_note) : null,
-          updated_at: now,
-        });
+        await dbQuery(
+          `INSERT INTO post_private_details (post_id, exact_handover_address, contact_phone, contact_note)
+           VALUES ($1, $2, $3, $4)`,
+          [
+            post.id,
+            body.exact_handover_address ? sanitizeText(body.exact_handover_address) : null,
+            body.contact_phone ? sanitizeText(body.contact_phone) : null,
+            body.contact_note ? sanitizeText(body.contact_note) : null,
+          ]
+        );
       }
 
-      return reply.status(201).send({ post: postDoc });
+      return reply.status(201).send({ post });
     }
   );
 
@@ -281,36 +278,40 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async (request) => {
-      if (!isFirebaseConfigured()) {
-        throw new AppError(503, 'SERVICE_UNAVAILABLE', 'Firebase is not configured yet');
-      }
-
       const { id } = request.params;
-      const db = getDb();
-      const snap = await db.collection('posts').doc(id).get();
+      const res = await dbQuery(
+        `SELECT p.*,
+                json_build_object('id', pr.id, 'full_name', pr.full_name, 'bio', pr.bio, 'location_city', pr.location_city, 'location_area', pr.location_area) AS author,
+                json_build_object('id', c.id, 'slug', c.slug, 'name_en', c.name_en, 'name_bn', c.name_bn, 'icon', c.icon, 'is_restricted', c.is_restricted, 'restriction_note_en', c.restriction_note_en, 'restriction_note_bn', c.restriction_note_bn) AS category
+         FROM posts p
+         JOIN profiles pr ON pr.id = p.author_id
+         JOIN categories c ON c.id = p.category_id
+         WHERE p.id = $1`,
+        [id]
+      );
 
-      if (!snap.exists) {
-        throw new AppError(404, 'NOT_FOUND', 'Post not found');
-      }
+      const post = res.rows[0];
+      if (!post) throw new AppError(404, 'NOT_FOUND', 'Post not found');
 
-      const post = { id: snap.id, ...snap.data() } as Record<string, unknown>;
       const isOwnerOrAdmin =
         request.authUser?.id === post.author_id || request.authUser?.role === 'admin';
-
       if (!['active', 'fulfilled'].includes(String(post.status)) && !isOwnerOrAdmin) {
         throw new AppError(404, 'NOT_FOUND', 'Post not available');
       }
 
-      void db
-        .collection('posts')
-        .doc(id)
-        .update({ view_count: Number(post.view_count || 0) + 1 });
+      void dbQuery('UPDATE posts SET view_count = view_count + 1 WHERE id = $1', [id]);
 
-      const [catSnap, authorSnap, signedImages] = await Promise.all([
-        db.collection('categories').doc(String(post.category_id)).get(),
-        db.collection('profiles').doc(String(post.author_id)).get(),
-        signPostImages((post.images as StoredImage[]) ?? []),
-      ]);
+      const imgRes = await dbQuery<{ id: string; file_id: string; sort_order: number }>(
+        'SELECT id, file_id, sort_order FROM post_images WHERE post_id = $1 ORDER BY sort_order ASC',
+        [id]
+      );
+
+      const baseUrl = `${request.protocol}://${request.headers.host}`;
+      const images = imgRes.rows.map((img) => ({
+        id: img.id,
+        sort_order: img.sort_order,
+        url: `${baseUrl}/api/v1/files/${img.file_id}`,
+      }));
 
       const authorizedForPrivate = await isAuthorizedForPrivatePostDetails(
         id,
@@ -323,56 +324,45 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
       let privateDocuments: Array<Record<string, unknown>> = [];
 
       if (authorizedForPrivate) {
-        const [privSnap, docsSnap] = await Promise.all([
-          db.collection('post_private_details').doc(id).get(),
-          db.collection('private_documents').where('post_id', '==', id).get(),
+        const [privRes, docsRes] = await Promise.all([
+          dbQuery(
+            'SELECT exact_handover_address, contact_phone, contact_note FROM post_private_details WHERE post_id = $1',
+            [id]
+          ),
+          dbQuery(
+            'SELECT id, file_id, file_name, mime_type, size_bytes, created_at FROM private_documents WHERE post_id = $1',
+            [id]
+          ),
         ]);
-        privateDetails = privSnap.exists ? (privSnap.data() as Record<string, unknown>) : null;
-        privateDocuments = await Promise.all(
-          docsSnap.docs.map(async (d) => {
-            const docData = d.data();
-            return {
-              id: d.id,
-              file_name: docData.file_name,
-              mime_type: docData.mime_type,
-              size_bytes: docData.size_bytes,
-              signed_url: await getSignedReadUrl(String(docData.storage_path), 900),
-              created_at: docData.created_at,
-            };
-          })
-        );
+        privateDetails = privRes.rows[0] ?? null;
+        privateDocuments = docsRes.rows.map((d) => ({
+          id: d.id,
+          file_name: d.file_name,
+          mime_type: d.mime_type,
+          size_bytes: d.size_bytes,
+          signed_url: `${baseUrl}/api/v1/files/${d.file_id}?token=${signFileToken(String(d.file_id))}`,
+          created_at: d.created_at,
+        }));
       }
 
       let monetarySummary: { pledged_total: number; confirmed_total: number } | null = null;
       if (post.donation_type === 'money') {
-        const contribsSnap = await db
-          .collection('contributions')
-          .where('post_id', '==', id)
-          .where('status', 'in', ['pledged', 'confirmed'])
-          .get();
-
-        const pledgedTotal = contribsSnap.docs
-          .filter((d) => d.data().status === 'pledged')
-          .reduce((sum, d) => sum + Number(d.data().amount || 0), 0);
-        const confirmedTotal = contribsSnap.docs
-          .filter((d) => d.data().status === 'confirmed')
-          .reduce((sum, d) => sum + Number(d.data().amount || 0), 0);
-
-        monetarySummary = { pledged_total: pledgedTotal, confirmed_total: confirmedTotal };
+        const sumRes = await dbQuery<{ status: string; total: string }>(
+          `SELECT status, COALESCE(SUM(amount), 0)::text AS total
+           FROM contributions
+           WHERE post_id = $1 AND status IN ('pledged', 'confirmed')
+           GROUP BY status`,
+          [id]
+        );
+        const pledged = Number(sumRes.rows.find((r) => r.status === 'pledged')?.total ?? 0);
+        const confirmed = Number(sumRes.rows.find((r) => r.status === 'confirmed')?.total ?? 0);
+        monetarySummary = { pledged_total: pledged, confirmed_total: confirmed };
       }
 
       return {
         post: {
           ...post,
-          category: catSnap.exists ? { id: catSnap.id, ...catSnap.data() } : null,
-          author: authorSnap.exists
-            ? {
-                id: authorSnap.id,
-                full_name: authorSnap.data()?.full_name,
-                location_city: authorSnap.data()?.location_city ?? null,
-              }
-            : post.author,
-          images: signedImages,
+          images,
           monetary_summary: monetarySummary,
           can_view_private_details: authorizedForPrivate,
           private_details: privateDetails,
@@ -403,12 +393,12 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         body.contact_note
       );
 
-      const db = getDb();
-      const postRef = db.collection('posts').doc(id);
-      const snap = await postRef.get();
-      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
-
-      const existing = snap.data()!;
+      const existingRes = await dbQuery<{ id: string; author_id: string; status: string; title: string }>(
+        'SELECT id, author_id, status, title FROM posts WHERE id = $1',
+        [id]
+      );
+      const existing = existingRes.rows[0];
+      if (!existing) throw new AppError(404, 'NOT_FOUND', 'Post not found');
       if (existing.author_id !== userId && request.authUser!.role !== 'admin') {
         throw new AppError(403, 'FORBIDDEN', 'You can only edit your own posts');
       }
@@ -416,55 +406,68 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(403, 'FORBIDDEN', 'Removed posts cannot be edited');
       }
 
-      const now = new Date().toISOString();
-      const updateFields: Record<string, unknown> = { updated_at: now };
-      if (body.title !== undefined) updateFields.title = sanitizeText(body.title);
-      if (body.description !== undefined) updateFields.description = sanitizeText(body.description);
-      if (body.quantity !== undefined) updateFields.quantity = body.quantity;
-      if (body.unit !== undefined) updateFields.unit = body.unit ? sanitizeText(body.unit) : null;
-      if (body.amount !== undefined) updateFields.amount = body.amount;
-      if (body.currency !== undefined) updateFields.currency = body.currency.toUpperCase();
-      if (body.location_city !== undefined) updateFields.location_city = sanitizeText(body.location_city);
-      if (body.location_area !== undefined) updateFields.location_area = body.location_area ? sanitizeText(body.location_area) : null;
-      if (body.urgency !== undefined) updateFields.urgency = body.urgency;
-      if (body.status !== undefined) updateFields.status = body.status;
-      if (body.expires_at !== undefined) updateFields.expires_at = body.expires_at;
-
-      await postRef.update(updateFields);
+      const updatedRes = await dbQuery(
+        `UPDATE posts
+         SET title = COALESCE($1, title),
+             description = COALESCE($2, description),
+             quantity = COALESCE($3, quantity),
+             unit = COALESCE($4, unit),
+             amount = COALESCE($5, amount),
+             currency = COALESCE($6, currency),
+             location_city = COALESCE($7, location_city),
+             location_area = COALESCE($8, location_area),
+             urgency = COALESCE($9, urgency),
+             status = COALESCE($10, status),
+             expires_at = COALESCE($11, expires_at),
+             updated_at = NOW()
+         WHERE id = $12
+         RETURNING *`,
+        [
+          body.title !== undefined ? sanitizeText(body.title) : null,
+          body.description !== undefined ? sanitizeText(body.description) : null,
+          body.quantity ?? null,
+          body.unit !== undefined ? (body.unit ? sanitizeText(body.unit) : null) : null,
+          body.amount ?? null,
+          body.currency ? body.currency.toUpperCase() : null,
+          body.location_city !== undefined ? sanitizeText(body.location_city) : null,
+          body.location_area !== undefined ? (body.location_area ? sanitizeText(body.location_area) : null) : null,
+          body.urgency ?? null,
+          body.status ?? null,
+          body.expires_at ?? null,
+          id,
+        ]
+      );
 
       if (
         body.exact_handover_address !== undefined ||
         body.contact_phone !== undefined ||
         body.contact_note !== undefined
       ) {
-        await db.collection('post_private_details').doc(id).set(
-          {
-            post_id: id,
-            updated_at: now,
-            ...(body.exact_handover_address !== undefined
-              ? { exact_handover_address: body.exact_handover_address ? sanitizeText(body.exact_handover_address) : null }
-              : {}),
-            ...(body.contact_phone !== undefined
-              ? { contact_phone: body.contact_phone ? sanitizeText(body.contact_phone) : null }
-              : {}),
-            ...(body.contact_note !== undefined
-              ? { contact_note: body.contact_note ? sanitizeText(body.contact_note) : null }
-              : {}),
-          },
-          { merge: true }
+        await dbQuery(
+          `INSERT INTO post_private_details (post_id, exact_handover_address, contact_phone, contact_note)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (post_id) DO UPDATE
+           SET exact_handover_address = COALESCE($2, post_private_details.exact_handover_address),
+               contact_phone = COALESCE($3, post_private_details.contact_phone),
+               contact_note = COALESCE($4, post_private_details.contact_note),
+               updated_at = NOW()`,
+          [
+            id,
+            body.exact_handover_address !== undefined ? (body.exact_handover_address ? sanitizeText(body.exact_handover_address) : null) : null,
+            body.contact_phone !== undefined ? (body.contact_phone ? sanitizeText(body.contact_phone) : null) : null,
+            body.contact_note !== undefined ? (body.contact_note ? sanitizeText(body.contact_note) : null) : null,
+          ]
         );
       }
 
       if (body.status && body.status !== existing.status) {
-        const claimsSnap = await db
-          .collection('claims')
-          .where('post_id', '==', id)
-          .where('status', 'in', ['pending', 'accepted'])
-          .get();
-
-        for (const c of claimsSnap.docs) {
+        const claimsRes = await dbQuery<{ claimant_id: string }>(
+          `SELECT claimant_id FROM claims WHERE post_id = $1 AND status IN ('pending', 'accepted')`,
+          [id]
+        );
+        for (const c of claimsRes.rows) {
           await createNotification({
-            userId: String(c.data().claimant_id),
+            userId: c.claimant_id,
             type: 'post_status_changed',
             title: 'Post status updated',
             body: `"${existing.title}" is now marked as ${body.status}.`,
@@ -473,8 +476,7 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         }
       }
 
-      const updatedSnap = await postRef.get();
-      return { post: { id: updatedSnap.id, ...updatedSnap.data() } };
+      return { post: updatedRes.rows[0] };
     }
   );
 
@@ -490,16 +492,13 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
-      const db = getDb();
-      const postRef = db.collection('posts').doc(id);
-      const snap = await postRef.get();
-
-      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
-      if (snap.data()!.author_id !== userId && request.authUser!.role !== 'admin') {
+      const existingRes = await dbQuery<{ author_id: string }>('SELECT author_id FROM posts WHERE id = $1', [id]);
+      const existing = existingRes.rows[0];
+      if (!existing) throw new AppError(404, 'NOT_FOUND', 'Post not found');
+      if (existing.author_id !== userId && request.authUser!.role !== 'admin') {
         throw new AppError(403, 'FORBIDDEN', 'You can only delete your own posts');
       }
-
-      await postRef.delete();
+      await dbQuery('DELETE FROM posts WHERE id = $1', [id]);
       return { success: true };
     }
   );
@@ -510,20 +509,17 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
       preHandler: [authenticate],
       schema: {
         tags: ['Posts'],
-        summary: 'Upload an image for a post to private Firebase Storage',
+        summary: 'Upload an image for a post',
       },
     },
     async (request, reply) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
-      const db = getDb();
-      const postRef = db.collection('posts').doc(id);
-      const postSnap = await postRef.get();
 
-      if (!postSnap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
-      if (postSnap.data()!.author_id !== userId) {
-        throw new AppError(403, 'FORBIDDEN', 'Only the post owner can upload images');
-      }
+      const postRes = await dbQuery<{ author_id: string }>('SELECT author_id FROM posts WHERE id = $1', [id]);
+      const post = postRes.rows[0];
+      if (!post) throw new AppError(404, 'NOT_FOUND', 'Post not found');
+      if (post.author_id !== userId) throw new AppError(403, 'FORBIDDEN', 'Only the post owner can upload images');
 
       const file = await request.file();
       if (!file) throw new AppError(400, 'BAD_REQUEST', 'No image file provided');
@@ -536,28 +532,27 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, 'VALIDATION_ERROR', 'Image must be 5MB or smaller');
       }
 
-      const ext = file.mimetype === 'image/png' ? 'png' : file.mimetype === 'image/webp' ? 'webp' : 'jpg';
-      const imageId = `${Date.now()}`;
-      const storagePath = `post-images/${userId}/${id}/${imageId}.${ext}`;
+      const blobRes = await dbQuery<{ id: string }>(
+        `INSERT INTO file_blobs (owner_id, bucket, file_name, mime_type, size_bytes, data)
+         VALUES ($1, 'post-images', $2, $3, $4, $5)
+         RETURNING id`,
+        [userId, file.filename || 'image', file.mimetype, buffer.length, buffer]
+      );
+      const fileId = blobRes.rows[0]!.id;
 
-      await uploadBufferToStorage(storagePath, buffer, file.mimetype);
+      const imgRes = await dbQuery<{ id: string; sort_order: number }>(
+        `INSERT INTO post_images (post_id, file_id, sort_order)
+         VALUES ($1, $2, (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM post_images WHERE post_id = $1))
+         RETURNING id, sort_order`,
+        [id, fileId]
+      );
 
-      const existingImages = (postSnap.data()!.images as StoredImage[]) ?? [];
-      const newImage: StoredImage = {
-        id: imageId,
-        storage_path: storagePath,
-        sort_order: existingImages.length,
-      };
-      await postRef.update({
-        images: [...existingImages, newImage],
-        updated_at: new Date().toISOString(),
-      });
-
+      const baseUrl = `${request.protocol}://${request.headers.host}`;
       return reply.status(201).send({
         image: {
-          id: newImage.id,
-          sort_order: newImage.sort_order,
-          url: await getSignedReadUrl(storagePath),
+          id: imgRes.rows[0]!.id,
+          sort_order: imgRes.rows[0]!.sort_order,
+          url: `${baseUrl}/api/v1/files/${fileId}`,
         },
       });
     }
@@ -575,13 +570,11 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
     async (request, reply) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
-      const db = getDb();
-      const postSnap = await db.collection('posts').doc(id).get();
 
-      if (!postSnap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
-      if (postSnap.data()!.author_id !== userId) {
-        throw new AppError(403, 'FORBIDDEN', 'Only the post owner can upload documents');
-      }
+      const postRes = await dbQuery<{ author_id: string }>('SELECT author_id FROM posts WHERE id = $1', [id]);
+      const post = postRes.rows[0];
+      if (!post) throw new AppError(404, 'NOT_FOUND', 'Post not found');
+      if (post.author_id !== userId) throw new AppError(403, 'FORBIDDEN', 'Only the post owner can upload documents');
 
       const file = await request.file();
       if (!file) throw new AppError(400, 'BAD_REQUEST', 'No document provided');
@@ -595,24 +588,22 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const safeName = file.filename.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 100);
-      const storagePath = `private-documents/${userId}/${id}/${Date.now()}-${safeName}`;
+      const blobRes = await dbQuery<{ id: string }>(
+        `INSERT INTO file_blobs (owner_id, bucket, file_name, mime_type, size_bytes, data)
+         VALUES ($1, 'private-documents', $2, $3, $4, $5)
+         RETURNING id`,
+        [userId, safeName, file.mimetype, buffer.length, buffer]
+      );
+      const fileId = blobRes.rows[0]!.id;
 
-      await uploadBufferToStorage(storagePath, buffer, file.mimetype);
+      const docRes = await dbQuery(
+        `INSERT INTO private_documents (post_id, uploader_id, file_id, file_name, mime_type, size_bytes)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id, post_id, uploader_id, file_id, file_name, mime_type, size_bytes, created_at`,
+        [id, userId, fileId, safeName, file.mimetype, buffer.length]
+      );
 
-      const docRef = db.collection('private_documents').doc();
-      const docRecord = {
-        id: docRef.id,
-        post_id: id,
-        uploader_id: userId,
-        storage_path: storagePath,
-        file_name: safeName,
-        mime_type: file.mimetype,
-        size_bytes: buffer.length,
-        created_at: new Date().toISOString(),
-      };
-      await docRef.set(docRecord);
-
-      return reply.status(201).send({ document: docRecord });
+      return reply.status(201).send({ document: docRes.rows[0] });
     }
   );
 }

@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
+import { dbQuery } from '../../lib/db.js';
 import { AppError } from '../../lib/errors.js';
-import { getDb } from '../../lib/firebase.js';
 import { sanitizeText } from '../../lib/security.js';
 import { authenticate } from '../../middleware/auth.js';
 import { createReportSchema } from '../../schemas/interactions.schema.js';
@@ -29,27 +29,24 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, 'BAD_REQUEST', 'You cannot file a complaint against your own account');
       }
 
-      const db = getDb();
-      const ref = db.collection('reports').doc();
-      const report = {
-        id: ref.id,
-        reporter_id: userId,
-        target_type: body.target_type,
-        target_post_id: body.target_post_id ?? null,
-        target_user_id: body.target_user_id ?? null,
-        claim_id: body.claim_id ?? null,
-        contribution_id: body.contribution_id ?? null,
-        reason: sanitizeText(body.reason),
-        details: body.details ? sanitizeText(body.details) : null,
-        status: 'open',
-        resolution_note: null,
-        resolved_by: null,
-        resolved_at: null,
-        created_at: new Date().toISOString(),
-      };
-      await ref.set(report);
+      const res = await dbQuery(
+        `INSERT INTO reports (
+          reporter_id, target_type, target_post_id, target_user_id, claim_id, contribution_id, reason, details, status
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'open')
+        RETURNING *`,
+        [
+          userId,
+          body.target_type,
+          body.target_post_id ?? null,
+          body.target_user_id ?? null,
+          body.claim_id ?? null,
+          body.contribution_id ?? null,
+          sanitizeText(body.reason),
+          body.details ? sanitizeText(body.details) : null,
+        ]
+      );
 
-      return reply.status(201).send({ report });
+      return reply.status(201).send({ report: res.rows[0] });
     }
   );
 
@@ -64,30 +61,18 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const db = getDb();
-      const snap = await db
-        .collection('reports')
-        .where('reporter_id', '==', userId)
-        .orderBy('created_at', 'desc')
-        .get();
-
-      const reports = await Promise.all(
-        snap.docs.map(async (d) => {
-          const r = d.data();
-          const [targetUserSnap, targetPostSnap] = await Promise.all([
-            r.target_user_id ? db.collection('profiles').doc(String(r.target_user_id)).get() : Promise.resolve(null),
-            r.target_post_id ? db.collection('posts').doc(String(r.target_post_id)).get() : Promise.resolve(null),
-          ]);
-          return {
-            id: d.id,
-            ...r,
-            target_user_name: targetUserSnap?.exists ? targetUserSnap.data()?.full_name : null,
-            target_post_title: targetPostSnap?.exists ? targetPostSnap.data()?.title : null,
-          };
-        })
+      const res = await dbQuery(
+        `SELECT r.*,
+                tu.full_name AS target_user_name,
+                p.title AS target_post_title
+         FROM reports r
+         LEFT JOIN profiles tu ON tu.id = r.target_user_id
+         LEFT JOIN posts p ON p.id = r.target_post_id
+         WHERE r.reporter_id = $1
+         ORDER BY r.created_at DESC`,
+        [userId]
       );
-
-      return { reports };
+      return { reports: res.rows };
     }
   );
 }

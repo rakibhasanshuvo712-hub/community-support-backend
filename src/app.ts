@@ -14,6 +14,7 @@ import { categoryRoutes } from './routes/v1/categories.js';
 import { claimRoutes } from './routes/v1/claims.js';
 import { contributionRoutes } from './routes/v1/contributions.js';
 import { conversationRoutes } from './routes/v1/conversations.js';
+import { fileRoutes } from './routes/v1/files.js';
 import { healthRoutes } from './routes/v1/health.js';
 import { notificationRoutes } from './routes/v1/notifications.js';
 import { postRoutes } from './routes/v1/posts.js';
@@ -97,6 +98,7 @@ export async function buildApp() {
       await v1.register(profileRoutes, { prefix: '/profiles' });
       await v1.register(categoryRoutes, { prefix: '/categories' });
       await v1.register(postRoutes, { prefix: '/posts' });
+      await v1.register(fileRoutes, { prefix: '/files' });
       await v1.register(claimRoutes);
       await v1.register(contributionRoutes);
       await v1.register(conversationRoutes, { prefix: '/conversations' });

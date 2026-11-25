@@ -3,21 +3,15 @@ import { buildApp } from '../src/app.js';
 import { assertNoSensitiveFinancialData, sanitizeText } from '../src/lib/security.js';
 import { AppError } from '../src/lib/errors.js';
 
-vi.mock('../src/lib/firebase.js', () => ({
-  getAdminAuth: vi.fn(() => ({
-    verifyIdToken: vi.fn().mockRejectedValue(new Error('Invalid token')),
-    updateUser: vi.fn(),
-    revokeRefreshTokens: vi.fn(),
-  })),
-  getDb: vi.fn(() => ({
-    collection: vi.fn(() => ({
-      limit: vi.fn().mockReturnThis(),
-      get: vi.fn().mockResolvedValue({ empty: true, docs: [] }),
-    })),
-  })),
-  getSignedReadUrl: vi.fn().mockResolvedValue(null),
-  uploadBufferToStorage: vi.fn(),
-}));
+vi.mock('../src/lib/db.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/lib/db.js')>();
+  return {
+    ...actual,
+    dbQuery: vi.fn().mockResolvedValue({ rows: [] }),
+    getPool: vi.fn(),
+    ensureSchemaMigrated: vi.fn().mockResolvedValue(undefined),
+  };
+});
 
 describe('Security & Validation Helpers', () => {
   it('blocks sensitive financial data such as CVV, PIN, OTP, and card numbers', () => {
@@ -38,13 +32,13 @@ describe('API Endpoints & Authorization', () => {
     vi.clearAllMocks();
   });
 
-  it('GET /api/v1/health returns 200 ok with firebase provider', async () => {
+  it('GET /api/v1/health returns 200 ok with neon-postgres provider', async () => {
     const app = await buildApp();
     const res = await app.inject({ method: 'GET', url: '/api/v1/health' });
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.status).toBe('ok');
-    expect(body.provider).toBe('firebase');
+    expect(body.provider).toBe('neon-postgres');
   });
 
   it('GET /api/v1/categories returns default categories', async () => {

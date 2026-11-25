@@ -1,4 +1,4 @@
-import { getDb } from '../lib/firebase.js';
+import { dbQuery } from '../lib/db.js';
 
 export type NotificationType =
   | 'new_offer'
@@ -19,17 +19,18 @@ export async function createNotification(params: {
   metadata?: Record<string, unknown>;
 }): Promise<void> {
   try {
-    const db = getDb();
-    await db.collection('notifications').add({
-      user_id: params.userId,
-      type: params.type,
-      title: params.title.slice(0, 200),
-      body: params.body.slice(0, 1000),
-      link: params.link?.slice(0, 300) ?? null,
-      is_read: false,
-      metadata: params.metadata ?? {},
-      created_at: new Date().toISOString(),
-    });
+    await dbQuery(
+      `INSERT INTO notifications (user_id, type, title, body, link, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        params.userId,
+        params.type,
+        params.title.slice(0, 200),
+        params.body.slice(0, 1000),
+        params.link?.slice(0, 300) ?? null,
+        JSON.stringify(params.metadata ?? {}),
+      ]
+    );
   } catch (err) {
     console.error('Failed to insert notification:', err);
   }
