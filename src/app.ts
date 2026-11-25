@@ -28,6 +28,7 @@ export async function buildApp() {
 
   await app.register(helmet, {
     contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
   });
 
   await app.register(cors, {
@@ -80,6 +81,14 @@ export async function buildApp() {
   });
 
   app.setErrorHandler(errorHandler);
+
+  app.get('/', async () => ({
+    status: 'ok',
+    service: 'community-support-api',
+    version: '1.0.0',
+    health: '/api/v1/health',
+    docs: '/docs',
+  }));
 
   await app.register(
     async (v1) => {
