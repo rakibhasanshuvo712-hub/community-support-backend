@@ -1,3 +1,4 @@
+import bcrypt from 'bcryptjs';
 import { Pool, type QueryResult, type QueryResultRow } from 'pg';
 import { env, isDatabaseConfigured } from '../config/env.js';
 
@@ -273,6 +274,29 @@ export async function ensureSchemaMigrated(): Promise<void> {
           cat.sort_order,
         ]
       );
+    }
+
+    if (env.ADMIN_EMAIL && env.ADMIN_PASSWORD) {
+      const adminEmail = env.ADMIN_EMAIL.toLowerCase().trim();
+      const existingAdmin = await p.query<{ id: string }>('SELECT id FROM users WHERE email = $1', [adminEmail]);
+      if (existingAdmin.rows.length === 0) {
+        const hash = await bcrypt.hash(env.ADMIN_PASSWORD, 10);
+        const uRes = await p.query<{ id: string }>(
+          'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id',
+          [adminEmail, hash]
+        );
+        const adminId = uRes.rows[0]!.id;
+        await p.query(
+          `INSERT INTO profiles (id, full_name, role) VALUES ($1, 'Platform Administrator', 'admin')`,
+          [adminId]
+        );
+        await p.query(
+          `INSERT INTO profile_contacts (user_id, email) VALUES ($1, $2)`,
+          [adminId, adminEmail]
+        );
+      } else {
+        await p.query(`UPDATE profiles SET role = 'admin' WHERE id = $1`, [existingAdmin.rows[0]!.id]);
+      }
     }
   })().catch((err) => {
     migratedPromise = null;
