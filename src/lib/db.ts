@@ -34,8 +34,9 @@ export function getPool(): Pool {
     throw new Error('DATABASE_URL is not configured');
   }
   if (!pool) {
+    const cleanUrl = env.DATABASE_URL.replace(/([?&])sslmode=[^&]+&?/i, '$1').replace(/[?&]$/, '');
     pool = new Pool({
-      connectionString: env.DATABASE_URL,
+      connectionString: cleanUrl,
       ssl: { rejectUnauthorized: false },
       max: 10,
     });
