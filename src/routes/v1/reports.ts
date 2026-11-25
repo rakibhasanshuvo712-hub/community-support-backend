@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { AppError } from '../../lib/errors.js';
+import { getDb } from '../../lib/firebase.js';
 import { sanitizeText } from '../../lib/security.js';
-import { supabaseAdmin } from '../../lib/supabase.js';
 import { authenticate } from '../../middleware/auth.js';
 import { createReportSchema } from '../../schemas/interactions.schema.js';
 
@@ -29,23 +29,22 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, 'BAD_REQUEST', 'You cannot report your own account');
       }
 
-      const { data: report, error } = await supabaseAdmin
-        .from('reports')
-        .insert({
-          reporter_id: userId,
-          target_type: body.target_type,
-          target_post_id: body.target_type === 'post' ? body.target_post_id : null,
-          target_user_id: body.target_type === 'user' ? body.target_user_id : null,
-          reason: sanitizeText(body.reason),
-          details: body.details ? sanitizeText(body.details) : null,
-          status: 'open',
-        })
-        .select()
-        .single();
-
-      if (error || !report) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to submit report');
-      }
+      const db = getDb();
+      const ref = db.collection('reports').doc();
+      const report = {
+        id: ref.id,
+        reporter_id: userId,
+        target_type: body.target_type,
+        target_post_id: body.target_type === 'post' ? body.target_post_id : null,
+        target_user_id: body.target_type === 'user' ? body.target_user_id : null,
+        reason: sanitizeText(body.reason),
+        details: body.details ? sanitizeText(body.details) : null,
+        status: 'open',
+        resolved_by: null,
+        resolved_at: null,
+        created_at: new Date().toISOString(),
+      };
+      await ref.set(report);
 
       return reply.status(201).send({ report });
     }
@@ -62,17 +61,13 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const { data, error } = await supabaseAdmin
-        .from('reports')
-        .select('*')
-        .eq('reporter_id', userId)
-        .order('created_at', { ascending: false });
+      const snap = await getDb()
+        .collection('reports')
+        .where('reporter_id', '==', userId)
+        .orderBy('created_at', 'desc')
+        .get();
 
-      if (error) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to fetch reports');
-      }
-
-      return { reports: data ?? [] };
+      return { reports: snap.docs.map((d) => ({ id: d.id, ...d.data() })) };
     }
   );
 }

@@ -1,6 +1,7 @@
 import type { FastifyRequest } from 'fastify';
 import { AppError } from '../lib/errors.js';
-import { supabaseAdmin } from '../lib/supabase.js';
+import { getAdminAuth, getDb } from '../lib/firebase.js';
+import { isFirebaseConfigured } from '../config/env.js';
 
 export interface AuthUser {
   id: string;
@@ -27,31 +28,34 @@ function extractBearerToken(request: FastifyRequest): string | null {
 }
 
 async function resolveUserFromToken(token: string): Promise<AuthUser> {
-  const { data, error } = await supabaseAdmin.auth.getUser(token);
-  if (error || !data.user) {
+  if (!isFirebaseConfigured()) {
+    throw new AppError(503, 'SERVICE_UNAVAILABLE', 'Firebase is not configured yet');
+  }
+
+  let decoded;
+  try {
+    decoded = await getAdminAuth().verifyIdToken(token);
+  } catch {
     throw new AppError(401, 'UNAUTHORIZED', 'Invalid or expired authentication token');
   }
 
-  const { data: profile, error: profileError } = await supabaseAdmin
-    .from('profiles')
-    .select('id, role, full_name, is_suspended')
-    .eq('id', data.user.id)
-    .single();
-
-  if (profileError || !profile) {
+  const db = getDb();
+  const profileSnap = await db.collection('profiles').doc(decoded.uid).get();
+  if (!profileSnap.exists) {
     throw new AppError(401, 'UNAUTHORIZED', 'User profile not found');
   }
 
+  const profile = profileSnap.data()!;
   if (profile.is_suspended) {
     throw new AppError(403, 'FORBIDDEN', 'Your account has been suspended');
   }
 
   return {
-    id: profile.id,
-    email: data.user.email ?? '',
+    id: decoded.uid,
+    email: decoded.email ?? '',
     role: profile.role === 'admin' ? 'admin' : 'user',
-    full_name: profile.full_name,
-    is_suspended: profile.is_suspended,
+    full_name: String(profile.full_name || 'Community Member'),
+    is_suspended: Boolean(profile.is_suspended),
   };
 }
 
@@ -71,7 +75,6 @@ export async function optionalAuth(request: FastifyRequest): Promise<void> {
     request.accessToken = token;
     request.authUser = await resolveUserFromToken(token);
   } catch {
-    // Guest fallback when optional auth token is invalid/expired
     request.authUser = undefined;
     request.accessToken = undefined;
   }

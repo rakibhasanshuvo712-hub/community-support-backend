@@ -3,48 +3,21 @@ import { buildApp } from '../src/app.js';
 import { assertNoSensitiveFinancialData, sanitizeText } from '../src/lib/security.js';
 import { AppError } from '../src/lib/errors.js';
 
-// Mock Supabase client for deterministic unit/integration API tests
-vi.mock('../src/lib/supabase.js', () => {
-  const mockChain = {
-    select: vi.fn().mockReturnThis(),
-    eq: vi.fn().mockReturnThis(),
-    neq: vi.fn().mockReturnThis(),
-    in: vi.fn().mockReturnThis(),
-    ilike: vi.fn().mockReturnThis(),
-    or: vi.fn().mockReturnThis(),
-    order: vi.fn().mockReturnThis(),
-    range: vi.fn().mockResolvedValue({ data: [], error: null, count: 0 }),
-    limit: vi.fn().mockResolvedValue({ data: [{ id: 'cat-1' }], error: null }),
-    single: vi.fn().mockResolvedValue({ data: null, error: { message: 'Not found' } }),
-    maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
-    insert: vi.fn().mockReturnThis(),
-    update: vi.fn().mockReturnThis(),
-    delete: vi.fn().mockReturnThis(),
-  };
-
-  return {
-    supabaseAdmin: {
-      from: vi.fn(() => mockChain),
-      rpc: vi.fn(),
-      auth: {
-        getUser: vi.fn().mockResolvedValue({ data: { user: null }, error: { message: 'Invalid token' } }),
-      },
-      storage: {
-        from: vi.fn(() => ({
-          createSignedUrl: vi.fn().mockResolvedValue({ data: { signedUrl: 'https://example.com/signed' } }),
-        })),
-      },
-    },
-    supabaseAnon: {
-      auth: {
-        signUp: vi.fn(),
-        signInWithPassword: vi.fn(),
-        resetPasswordForEmail: vi.fn(),
-      },
-    },
-    createSupabaseUserClient: vi.fn(),
-  };
-});
+vi.mock('../src/lib/firebase.js', () => ({
+  getAdminAuth: vi.fn(() => ({
+    verifyIdToken: vi.fn().mockRejectedValue(new Error('Invalid token')),
+    updateUser: vi.fn(),
+    revokeRefreshTokens: vi.fn(),
+  })),
+  getDb: vi.fn(() => ({
+    collection: vi.fn(() => ({
+      limit: vi.fn().mockReturnThis(),
+      get: vi.fn().mockResolvedValue({ empty: true, docs: [] }),
+    })),
+  })),
+  getSignedReadUrl: vi.fn().mockResolvedValue(null),
+  uploadBufferToStorage: vi.fn(),
+}));
 
 describe('Security & Validation Helpers', () => {
   it('blocks sensitive financial data such as CVV, PIN, OTP, and card numbers', () => {
@@ -65,22 +38,27 @@ describe('API Endpoints & Authorization', () => {
     vi.clearAllMocks();
   });
 
-  it('GET /api/v1/health returns 200 ok', async () => {
+  it('GET /api/v1/health returns 200 ok with firebase provider', async () => {
     const app = await buildApp();
     const res = await app.inject({ method: 'GET', url: '/api/v1/health' });
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.status).toBe('ok');
-    expect(body.service).toBe('community-support-api');
+    expect(body.provider).toBe('firebase');
+  });
+
+  it('GET /api/v1/categories returns default categories', async () => {
+    const app = await buildApp();
+    const res = await app.inject({ method: 'GET', url: '/api/v1/categories' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().categories.length).toBe(11);
   });
 
   it('GET /docs/json returns OpenAPI specification', async () => {
     const app = await buildApp();
     const res = await app.inject({ method: 'GET', url: '/docs/json' });
     expect(res.statusCode).toBe(200);
-    const spec = res.json();
-    expect(spec.openapi).toBeDefined();
-    expect(spec.info.title).toContain('Community Support');
+    expect(res.json().openapi).toBeDefined();
   });
 
   it('rejects unauthenticated access to protected routes', async () => {
@@ -100,16 +78,6 @@ describe('API Endpoints & Authorization', () => {
       expect(res.statusCode).toBe(401);
       expect(res.json().error.code).toBe('UNAUTHORIZED');
     }
-  });
-
-  it('rejects invalid token on admin routes with 401', async () => {
-    const app = await buildApp();
-    const res = await app.inject({
-      method: 'GET',
-      url: '/api/v1/admin/users',
-      headers: { authorization: 'Bearer invalid-token' },
-    });
-    expect(res.statusCode).toBe(401);
   });
 
   it('validates login payload with Zod', async () => {

@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
-import { isSupabaseConfigured } from '../../config/env.js';
-import { supabaseAdmin } from '../../lib/supabase.js';
+import { isFirebaseConfigured } from '../../config/env.js';
+import { getDb } from '../../lib/firebase.js';
 
 export async function healthRoutes(app: FastifyInstance): Promise<void> {
   app.get(
@@ -8,20 +8,25 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
     {
       schema: {
         tags: ['Health'],
-        summary: 'API & database health check',
+        summary: 'API & Firebase Firestore health check',
       },
     },
     async () => {
       let dbStatus: 'connected' | 'unconfigured' | 'error' = 'unconfigured';
-      if (isSupabaseConfigured()) {
-        const { error } = await supabaseAdmin.from('categories').select('id').limit(1);
-        dbStatus = error ? 'error' : 'connected';
+      if (isFirebaseConfigured()) {
+        try {
+          await getDb().collection('categories').limit(1).get();
+          dbStatus = 'connected';
+        } catch {
+          dbStatus = 'error';
+        }
       }
 
       return {
         status: 'ok',
         service: 'community-support-api',
         version: '1.0.0',
+        provider: 'firebase',
         timestamp: new Date().toISOString(),
         database: dbStatus,
       };

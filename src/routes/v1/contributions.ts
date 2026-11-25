@@ -1,13 +1,12 @@
 import type { FastifyInstance } from 'fastify';
 import { AppError } from '../../lib/errors.js';
+import { getDb } from '../../lib/firebase.js';
 import { assertNoSensitiveFinancialData, sanitizeText } from '../../lib/security.js';
-import { supabaseAdmin } from '../../lib/supabase.js';
 import { authenticate } from '../../middleware/auth.js';
 import { createContributionSchema } from '../../schemas/interactions.schema.js';
 import { createNotification } from '../../services/notifications.service.js';
 
 export async function contributionRoutes(app: FastifyInstance): Promise<void> {
-  // Make a monetary pledge (platform NEVER holds or collects money)
   app.post<{ Params: { postId: string } }>(
     '/posts/:postId/contributions',
     {
@@ -24,13 +23,11 @@ export async function contributionRoutes(app: FastifyInstance): Promise<void> {
 
       assertNoSensitiveFinancialData(body.note);
 
-      const { data: post } = await supabaseAdmin
-        .from('posts')
-        .select('id, author_id, donation_type, status, title')
-        .eq('id', postId)
-        .single();
+      const db = getDb();
+      const postSnap = await db.collection('posts').doc(postId).get();
+      if (!postSnap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
 
-      if (!post) throw new AppError(404, 'NOT_FOUND', 'Post not found');
+      const post = postSnap.data()!;
       if (post.author_id === userId) {
         throw new AppError(400, 'BAD_REQUEST', 'You cannot pledge to your own post');
       }
@@ -41,38 +38,37 @@ export async function contributionRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, 'BAD_REQUEST', 'This post is no longer accepting pledges');
       }
 
-      const { data: contribution, error } = await supabaseAdmin
-        .from('contributions')
-        .insert({
-          post_id: postId,
-          contributor_id: userId,
-          amount: body.amount,
-          currency: body.currency.toUpperCase(),
-          note: body.note ? sanitizeText(body.note) : null,
-          status: 'pledged',
-          donor_confirmed: false,
-          recipient_confirmed: false,
-        })
-        .select()
-        .single();
-
-      if (error || !contribution) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to record pledge');
-      }
+      const now = new Date().toISOString();
+      const ref = db.collection('contributions').doc();
+      const contribDoc = {
+        id: ref.id,
+        post_id: postId,
+        post_author_id: post.author_id,
+        contributor_id: userId,
+        amount: body.amount,
+        currency: body.currency.toUpperCase(),
+        note: body.note ? sanitizeText(body.note) : null,
+        status: 'pledged',
+        donor_confirmed: false,
+        recipient_confirmed: false,
+        confirmed_at: null,
+        created_at: now,
+        updated_at: now,
+      };
+      await ref.set(contribDoc);
 
       await createNotification({
-        userId: post.author_id,
+        userId: String(post.author_id),
         type: 'new_offer',
         title: 'New monetary pledge',
         body: `${request.authUser!.full_name} pledged ${body.amount} ${body.currency.toUpperCase()} for "${post.title}". Coordinate direct transfer and confirm once received.`,
         link: `/posts/${postId}`,
       });
 
-      return reply.status(201).send({ contribution });
+      return reply.status(201).send({ contribution: contribDoc });
     }
   );
 
-  // List my contributions (made and received)
   app.get(
     '/contributions/mine',
     {
@@ -84,45 +80,41 @@ export async function contributionRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
+      const db = getDb();
 
-      const [{ data: outgoing }, { data: myPosts }] = await Promise.all([
-        supabaseAdmin
-          .from('contributions')
-          .select(
-            `
-            *,
-            post:posts(id, title, currency, status, author_id,
-              author:profiles!posts_author_id_fkey(id, full_name))
-          `
-          )
-          .eq('contributor_id', userId)
-          .order('created_at', { ascending: false }),
-        supabaseAdmin.from('posts').select('id').eq('author_id', userId),
+      const [outgoingSnap, incomingSnap] = await Promise.all([
+        db.collection('contributions').where('contributor_id', '==', userId).orderBy('created_at', 'desc').get(),
+        db.collection('contributions').where('post_author_id', '==', userId).orderBy('created_at', 'desc').get(),
       ]);
 
-      const postIds = (myPosts ?? []).map((p) => p.id);
-      let incoming: unknown[] = [];
+      const hydrate = async (docs: FirebaseFirestore.QueryDocumentSnapshot[]) =>
+        Promise.all(
+          docs.map(async (d) => {
+            const c = d.data();
+            const [postSnap, contribSnap] = await Promise.all([
+              db.collection('posts').doc(String(c.post_id)).get(),
+              db.collection('profiles').doc(String(c.contributor_id)).get(),
+            ]);
+            return {
+              id: d.id,
+              ...c,
+              post: postSnap.exists ? { id: postSnap.id, ...postSnap.data() } : null,
+              contributor: contribSnap.exists
+                ? { id: contribSnap.id, full_name: contribSnap.data()?.full_name }
+                : null,
+            };
+          })
+        );
 
-      if (postIds.length > 0) {
-        const { data: inc } = await supabaseAdmin
-          .from('contributions')
-          .select(
-            `
-            *,
-            contributor:profiles!contributions_contributor_id_fkey(id, full_name),
-            post:posts(id, title, currency, status)
-          `
-          )
-          .in('post_id', postIds)
-          .order('created_at', { ascending: false });
-        incoming = inc ?? [];
-      }
+      const [outgoing, incoming] = await Promise.all([
+        hydrate(outgoingSnap.docs),
+        hydrate(incomingSnap.docs),
+      ]);
 
-      return { outgoing: outgoing ?? [], incoming };
+      return { outgoing, incoming };
     }
   );
 
-  // Confirm direct transfer (status becomes 'confirmed' ONLY when BOTH donor and recipient confirm)
   app.patch<{ Params: { id: string } }>(
     '/contributions/:id/confirm',
     {
@@ -135,19 +127,18 @@ export async function contributionRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
+      const db = getDb();
+      const ref = db.collection('contributions').doc(id);
+      const snap = await ref.get();
 
-      const { data: contrib } = await supabaseAdmin
-        .from('contributions')
-        .select('*, post:posts(id, author_id, post_type, title)')
-        .eq('id', id)
-        .single();
-
-      if (!contrib) throw new AppError(404, 'NOT_FOUND', 'Contribution not found');
+      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'Contribution not found');
+      const contrib = snap.data()!;
       if (contrib.status !== 'pledged') {
         throw new AppError(409, 'CONFLICT', 'Only pledged contributions can be confirmed');
       }
 
-      const post = contrib.post as { id: string; author_id: string; post_type: string; title: string };
+      const postSnap = await db.collection('posts').doc(String(contrib.post_id)).get();
+      const post = postSnap.data()!;
       const isContributor = contrib.contributor_id === userId;
       const isPostOwner = post.author_id === userId;
 
@@ -159,25 +150,21 @@ export async function contributionRoutes(app: FastifyInstance): Promise<void> {
         (post.post_type === 'help_request' && isContributor) ||
         (post.post_type === 'donation_offer' && isPostOwner);
 
-      const nextDonorConfirmed = isUserDonor ? true : contrib.donor_confirmed;
-      const nextRecipientConfirmed = !isUserDonor ? true : contrib.recipient_confirmed;
+      const nextDonorConfirmed = isUserDonor ? true : Boolean(contrib.donor_confirmed);
+      const nextRecipientConfirmed = !isUserDonor ? true : Boolean(contrib.recipient_confirmed);
       const bothConfirmed = nextDonorConfirmed && nextRecipientConfirmed;
+      const now = new Date().toISOString();
 
-      const { data: updated, error } = await supabaseAdmin
-        .from('contributions')
-        .update({
-          donor_confirmed: nextDonorConfirmed,
-          recipient_confirmed: nextRecipientConfirmed,
-          status: bothConfirmed ? 'confirmed' : 'pledged',
-          confirmed_at: bothConfirmed ? new Date().toISOString() : null,
-        })
-        .eq('id', id)
-        .select()
-        .single();
+      const updates = {
+        donor_confirmed: nextDonorConfirmed,
+        recipient_confirmed: nextRecipientConfirmed,
+        status: bothConfirmed ? 'confirmed' : 'pledged',
+        confirmed_at: bothConfirmed ? now : null,
+        updated_at: now,
+      };
+      await ref.update(updates);
 
-      if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Failed to confirm contribution');
-
-      const otherUserId = isContributor ? post.author_id : contrib.contributor_id;
+      const otherUserId = isContributor ? String(post.author_id) : String(contrib.contributor_id);
       await createNotification({
         userId: otherUserId,
         type: 'contribution_confirmed',
@@ -185,14 +172,13 @@ export async function contributionRoutes(app: FastifyInstance): Promise<void> {
         body: bothConfirmed
           ? `Both parties confirmed the direct transfer for "${post.title}".`
           : `The other party marked the direct transfer as complete for "${post.title}". Please confirm once verified.`,
-        link: `/posts/${post.id}`,
+        link: `/posts/${contrib.post_id}`,
       });
 
-      return { contribution: updated };
+      return { contribution: { id, ...contrib, ...updates } };
     }
   );
 
-  // Cancel pledge
   app.patch<{ Params: { id: string } }>(
     '/contributions/:id/cancel',
     {
@@ -205,31 +191,22 @@ export async function contributionRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
+      const db = getDb();
+      const ref = db.collection('contributions').doc(id);
+      const snap = await ref.get();
 
-      const { data: contrib } = await supabaseAdmin
-        .from('contributions')
-        .select('*, post:posts(author_id)')
-        .eq('id', id)
-        .single();
-
-      if (!contrib) throw new AppError(404, 'NOT_FOUND', 'Contribution not found');
-      const post = contrib.post as { author_id: string };
-      if (contrib.contributor_id !== userId && post.author_id !== userId) {
+      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'Contribution not found');
+      const contrib = snap.data()!;
+      if (contrib.contributor_id !== userId && contrib.post_author_id !== userId) {
         throw new AppError(403, 'FORBIDDEN', 'Not authorized to cancel this pledge');
       }
       if (contrib.status !== 'pledged') {
         throw new AppError(409, 'CONFLICT', 'Only pledged contributions can be cancelled');
       }
 
-      const { data: updated, error } = await supabaseAdmin
-        .from('contributions')
-        .update({ status: 'cancelled' })
-        .eq('id', id)
-        .select()
-        .single();
-
-      if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Failed to cancel pledge');
-      return { contribution: updated };
+      const now = new Date().toISOString();
+      await ref.update({ status: 'cancelled', updated_at: now });
+      return { contribution: { id, ...contrib, status: 'cancelled', updated_at: now } };
     }
   );
 }

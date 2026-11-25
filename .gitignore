@@ -9,3 +9,5 @@ coverage/
 Thumbs.db
 supabase/.branches/
 supabase/.temp/
+
+.vercel

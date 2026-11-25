@@ -1,7 +1,8 @@
 import type { FastifyInstance } from 'fastify';
+import { isFirebaseConfigured } from '../../config/env.js';
 import { AppError } from '../../lib/errors.js';
+import { getDb, getSignedReadUrl, uploadBufferToStorage } from '../../lib/firebase.js';
 import { assertNoSensitiveFinancialData, sanitizeText } from '../../lib/security.js';
-import { supabaseAdmin } from '../../lib/supabase.js';
 import { authenticate, optionalAuth } from '../../middleware/auth.js';
 import {
   createPostSchema,
@@ -9,57 +10,62 @@ import {
   updatePostSchema,
 } from '../../schemas/posts.schema.js';
 import { createNotification } from '../../services/notifications.service.js';
+import { ensureCategoriesSeeded } from '../../services/seed.service.js';
 
 const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const ALLOWED_DOC_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png', 'image/webp']);
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_DOC_BYTES = 10 * 1024 * 1024;
 
-async function signPostImages(images: Array<{ id: string; storage_path: string; sort_order: number }>) {
+interface StoredImage {
+  id: string;
+  storage_path: string;
+  sort_order: number;
+}
+
+async function signPostImages(images: StoredImage[]) {
   if (!images || images.length === 0) return [];
   const signed = await Promise.all(
-    images.map(async (img) => {
-      const { data } = await supabaseAdmin.storage
-        .from('post-images')
-        .createSignedUrl(img.storage_path, 3600);
-      return {
-        id: img.id,
-        sort_order: img.sort_order,
-        url: data?.signedUrl ?? null,
-      };
-    })
+    images.map(async (img) => ({
+      id: img.id,
+      sort_order: img.sort_order,
+      url: await getSignedReadUrl(img.storage_path),
+    }))
   );
   return signed.sort((a, b) => a.sort_order - b.sort_order);
 }
 
-async function isAuthorizedForPrivatePostDetails(postId: string, authorId: string, userId?: string, role?: string): Promise<boolean> {
+async function isAuthorizedForPrivatePostDetails(
+  postId: string,
+  authorId: string,
+  userId?: string,
+  role?: string
+): Promise<boolean> {
   if (!userId) return false;
   if (userId === authorId || role === 'admin') return true;
 
-  const [{ data: claim }, { data: contribution }] = await Promise.all([
-    supabaseAdmin
-      .from('claims')
-      .select('id')
-      .eq('post_id', postId)
-      .eq('claimant_id', userId)
-      .in('status', ['accepted', 'completed'])
+  const db = getDb();
+  const [claimsSnap, contribSnap] = await Promise.all([
+    db
+      .collection('claims')
+      .where('post_id', '==', postId)
+      .where('claimant_id', '==', userId)
+      .where('status', 'in', ['accepted', 'completed'])
       .limit(1)
-      .maybeSingle(),
-    supabaseAdmin
-      .from('contributions')
-      .select('id')
-      .eq('post_id', postId)
-      .eq('contributor_id', userId)
-      .in('status', ['pledged', 'confirmed'])
+      .get(),
+    db
+      .collection('contributions')
+      .where('post_id', '==', postId)
+      .where('contributor_id', '==', userId)
+      .where('status', 'in', ['pledged', 'confirmed'])
       .limit(1)
-      .maybeSingle(),
+      .get(),
   ]);
 
-  return Boolean(claim || contribution);
+  return !claimsSnap.empty || !contribSnap.empty;
 }
 
 export async function postRoutes(app: FastifyInstance): Promise<void> {
-  // List & search posts with filters and pagination
   app.get(
     '/',
     {
@@ -70,76 +76,67 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async (request) => {
+      if (!isFirebaseConfigured()) {
+        return {
+          posts: [],
+          pagination: { page: 1, limit: 12, total: 0, total_pages: 0 },
+        };
+      }
+
+      await ensureCategoriesSeeded();
       const query = listPostsQuerySchema.parse(request.query);
-      const from = (query.page - 1) * query.limit;
-      const to = from + query.limit - 1;
+      const db = getDb();
 
-      let categoryId = query.category_id;
-      if (!categoryId && query.category_slug) {
-        const { data: cat } = await supabaseAdmin
-          .from('categories')
-          .select('id')
-          .eq('slug', query.category_slug)
-          .maybeSingle();
-        if (cat) {
-          categoryId = cat.id;
-        } else {
-          return { posts: [], pagination: { page: query.page, limit: query.limit, total: 0, total_pages: 0 } };
-        }
+      const snap = await db
+        .collection('posts')
+        .where('status', 'in', query.status ? [query.status] : ['active', 'fulfilled'])
+        .orderBy('created_at', 'desc')
+        .limit(200)
+        .get();
+
+      let items = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Record<string, unknown>));
+
+      if (query.post_type) items = items.filter((p) => p.post_type === query.post_type);
+      if (query.donation_type) items = items.filter((p) => p.donation_type === query.donation_type);
+      if (query.urgency) items = items.filter((p) => p.urgency === query.urgency);
+      if (query.category_id) items = items.filter((p) => p.category_id === query.category_id);
+      if (query.category_slug) items = items.filter((p) => p.category_id === query.category_slug);
+      if (query.city) {
+        const c = query.city.toLowerCase();
+        items = items.filter((p) => String(p.location_city || '').toLowerCase().includes(c));
       }
-
-      let dbQuery = supabaseAdmin
-        .from('posts')
-        .select(
-          `
-          id, author_id, post_type, donation_type, category_id, title, description,
-          quantity, unit, amount, currency, location_city, location_area, urgency,
-          status, safety_acknowledged, expires_at, view_count, created_at, updated_at,
-          author:profiles!posts_author_id_fkey(id, full_name, avatar_url, location_city),
-          category:categories!posts_category_id_fkey(id, slug, name_en, name_bn, icon, is_restricted),
-          images:post_images(id, storage_path, sort_order)
-        `,
-          { count: 'exact' }
-        );
-
-      if (query.status) {
-        dbQuery = dbQuery.eq('status', query.status);
-      } else {
-        dbQuery = dbQuery.in('status', ['active', 'fulfilled']);
-      }
-
-      if (query.post_type) dbQuery = dbQuery.eq('post_type', query.post_type);
-      if (query.donation_type) dbQuery = dbQuery.eq('donation_type', query.donation_type);
-      if (query.urgency) dbQuery = dbQuery.eq('urgency', query.urgency);
-      if (categoryId) dbQuery = dbQuery.eq('category_id', categoryId);
-      if (query.city) dbQuery = dbQuery.ilike('location_city', `%${query.city}%`);
       if (query.q) {
-        const safeQ = query.q.replace(/[%_,]/g, '');
-        dbQuery = dbQuery.or(`title.ilike.%${safeQ}%,description.ilike.%${safeQ}%,location_city.ilike.%${safeQ}%`);
+        const qLower = query.q.toLowerCase();
+        items = items.filter(
+          (p) =>
+            String(p.title || '').toLowerCase().includes(qLower) ||
+            String(p.description || '').toLowerCase().includes(qLower) ||
+            String(p.location_city || '').toLowerCase().includes(qLower)
+        );
       }
 
       if (query.sort === 'urgent') {
-        dbQuery = dbQuery.order('urgency', { ascending: true }).order('created_at', { ascending: false });
+        const rank: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+        items.sort((a, b) => (rank[String(a.urgency)] ?? 9) - (rank[String(b.urgency)] ?? 9));
       } else if (query.sort === 'relevant') {
-        dbQuery = dbQuery.order('view_count', { ascending: false }).order('created_at', { ascending: false });
-      } else {
-        dbQuery = dbQuery.order('created_at', { ascending: false });
+        items.sort((a, b) => Number(b.view_count || 0) - Number(a.view_count || 0));
       }
 
-      const { data, error, count } = await dbQuery.range(from, to);
+      const total = items.length;
+      const start = (query.page - 1) * query.limit;
+      const paged = items.slice(start, start + query.limit);
 
-      if (error) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to fetch posts');
-      }
+      const catSnap = await db.collection('categories').get();
+      const catMap = new Map(catSnap.docs.map((c) => [c.id, { id: c.id, ...c.data() }]));
 
       const posts = await Promise.all(
-        (data ?? []).map(async (post) => ({
+        paged.map(async (post) => ({
           ...post,
-          images: await signPostImages((post.images as Array<{ id: string; storage_path: string; sort_order: number }>) ?? []),
+          category: catMap.get(String(post.category_id)) ?? null,
+          images: await signPostImages((post.images as StoredImage[]) ?? []),
         }))
       );
 
-      const total = count ?? 0;
       return {
         posts,
         pagination: {
@@ -152,7 +149,6 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  // Get current user's posts
   app.get(
     '/mine',
     {
@@ -164,37 +160,31 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const { data, error } = await supabaseAdmin
-        .from('posts')
-        .select(
-          `
-          id, author_id, post_type, donation_type, category_id, title, description,
-          quantity, unit, amount, currency, location_city, location_area, urgency,
-          status, safety_acknowledged, expires_at, view_count, created_at, updated_at,
-          category:categories!posts_category_id_fkey(id, slug, name_en, name_bn, icon, is_restricted),
-          images:post_images(id, storage_path, sort_order)
-        `
-        )
-        .eq('author_id', userId)
-        .neq('status', 'removed')
-        .order('created_at', { ascending: false });
+      const db = getDb();
+      const snap = await db
+        .collection('posts')
+        .where('author_id', '==', userId)
+        .orderBy('created_at', 'desc')
+        .get();
 
-      if (error) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to fetch your posts');
-      }
+      const catSnap = await db.collection('categories').get();
+      const catMap = new Map(catSnap.docs.map((c) => [c.id, { id: c.id, ...c.data() }]));
 
       const posts = await Promise.all(
-        (data ?? []).map(async (post) => ({
-          ...post,
-          images: await signPostImages((post.images as Array<{ id: string; storage_path: string; sort_order: number }>) ?? []),
-        }))
+        snap.docs
+          .map((d) => ({ id: d.id, ...d.data() } as Record<string, unknown>))
+          .filter((p) => p.status !== 'removed')
+          .map(async (post) => ({
+            ...post,
+            category: catMap.get(String(post.category_id)) ?? null,
+            images: await signPostImages((post.images as StoredImage[]) ?? []),
+          }))
       );
 
       return { posts };
     }
   );
 
-  // Create a post (published immediately after validation)
   app.post(
     '/',
     {
@@ -215,16 +205,14 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         body.contact_note
       );
 
-      const { data: category, error: catError } = await supabaseAdmin
-        .from('categories')
-        .select('id, slug, is_restricted')
-        .eq('id', body.category_id)
-        .single();
-
-      if (catError || !category) {
+      await ensureCategoriesSeeded();
+      const db = getDb();
+      const catSnap = await db.collection('categories').doc(body.category_id).get();
+      if (!catSnap.exists) {
         throw new AppError(400, 'VALIDATION_ERROR', 'Invalid category selected');
       }
 
+      const category = catSnap.data()!;
       if (category.is_restricted && !body.safety_acknowledged) {
         throw new AppError(
           400,
@@ -237,47 +225,52 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, 'VALIDATION_ERROR', 'Target or offered amount is required for monetary posts');
       }
 
-      const { data: post, error: insertError } = await supabaseAdmin
-        .from('posts')
-        .insert({
-          author_id: userId,
-          post_type: body.post_type,
-          donation_type: body.donation_type,
-          category_id: body.category_id,
-          title: sanitizeText(body.title),
-          description: sanitizeText(body.description),
-          quantity: body.quantity ?? null,
-          unit: body.unit ? sanitizeText(body.unit) : null,
-          amount: body.amount ?? null,
-          currency: body.currency.toUpperCase(),
-          location_city: sanitizeText(body.location_city),
-          location_area: body.location_area ? sanitizeText(body.location_area) : null,
-          urgency: body.urgency,
-          status: 'active',
-          safety_acknowledged: body.safety_acknowledged,
-          expires_at: body.expires_at ?? null,
-        })
-        .select()
-        .single();
+      const now = new Date().toISOString();
+      const postRef = db.collection('posts').doc();
+      const postDoc = {
+        id: postRef.id,
+        author_id: userId,
+        author: {
+          id: userId,
+          full_name: request.authUser!.full_name,
+        },
+        post_type: body.post_type,
+        donation_type: body.donation_type,
+        category_id: body.category_id,
+        title: sanitizeText(body.title),
+        description: sanitizeText(body.description),
+        quantity: body.quantity ?? null,
+        unit: body.unit ? sanitizeText(body.unit) : null,
+        amount: body.amount ?? null,
+        currency: body.currency.toUpperCase(),
+        location_city: sanitizeText(body.location_city),
+        location_area: body.location_area ? sanitizeText(body.location_area) : null,
+        urgency: body.urgency,
+        status: 'active',
+        safety_acknowledged: body.safety_acknowledged,
+        expires_at: body.expires_at ?? null,
+        view_count: 0,
+        images: [],
+        created_at: now,
+        updated_at: now,
+      };
 
-      if (insertError || !post) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to create post');
-      }
+      await postRef.set(postDoc);
 
       if (body.exact_handover_address || body.contact_phone || body.contact_note) {
-        await supabaseAdmin.from('post_private_details').upsert({
-          post_id: post.id,
+        await db.collection('post_private_details').doc(postRef.id).set({
+          post_id: postRef.id,
           exact_handover_address: body.exact_handover_address ? sanitizeText(body.exact_handover_address) : null,
           contact_phone: body.contact_phone ? sanitizeText(body.contact_phone) : null,
           contact_note: body.contact_note ? sanitizeText(body.contact_note) : null,
+          updated_at: now,
         });
       }
 
-      return reply.status(201).send({ post });
+      return reply.status(201).send({ post: postDoc });
     }
   );
 
-  // Get post details (publicly safe; private contact details & docs gated)
   app.get<{ Params: { id: string } }>(
     '/:id',
     {
@@ -288,47 +281,40 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async (request) => {
-      const { id } = request.params;
-      const { data: post, error } = await supabaseAdmin
-        .from('posts')
-        .select(
-          `
-          id, author_id, post_type, donation_type, category_id, title, description,
-          quantity, unit, amount, currency, location_city, location_area, urgency,
-          status, safety_acknowledged, expires_at, view_count, created_at, updated_at,
-          author:profiles!posts_author_id_fkey(id, full_name, avatar_url, bio, location_city, location_area),
-          category:categories!posts_category_id_fkey(id, slug, name_en, name_bn, icon, is_restricted, restriction_note_en, restriction_note_bn),
-          images:post_images(id, storage_path, sort_order)
-        `
-        )
-        .eq('id', id)
-        .single();
+      if (!isFirebaseConfigured()) {
+        throw new AppError(503, 'SERVICE_UNAVAILABLE', 'Firebase is not configured yet');
+      }
 
-      if (error || !post) {
+      const { id } = request.params;
+      const db = getDb();
+      const snap = await db.collection('posts').doc(id).get();
+
+      if (!snap.exists) {
         throw new AppError(404, 'NOT_FOUND', 'Post not found');
       }
 
+      const post = { id: snap.id, ...snap.data() } as Record<string, unknown>;
       const isOwnerOrAdmin =
         request.authUser?.id === post.author_id || request.authUser?.role === 'admin';
 
-      if (!['active', 'fulfilled'].includes(post.status) && !isOwnerOrAdmin) {
+      if (!['active', 'fulfilled'].includes(String(post.status)) && !isOwnerOrAdmin) {
         throw new AppError(404, 'NOT_FOUND', 'Post not available');
       }
 
-      // Increment view count asynchronously
-      void supabaseAdmin
-        .from('posts')
-        .update({ view_count: (post.view_count ?? 0) + 1 })
-        .eq('id', id);
+      void db
+        .collection('posts')
+        .doc(id)
+        .update({ view_count: Number(post.view_count || 0) + 1 });
 
-      const signedImages = await signPostImages(
-        (post.images as Array<{ id: string; storage_path: string; sort_order: number }>) ?? []
-      );
+      const [catSnap, authorSnap, signedImages] = await Promise.all([
+        db.collection('categories').doc(String(post.category_id)).get(),
+        db.collection('profiles').doc(String(post.author_id)).get(),
+        signPostImages((post.images as StoredImage[]) ?? []),
+      ]);
 
-      // Private contact & documents ONLY if authorized
       const authorizedForPrivate = await isAuthorizedForPrivatePostDetails(
         id,
-        post.author_id,
+        String(post.author_id),
         request.authUser?.id,
         request.authUser?.role
       );
@@ -337,63 +323,55 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
       let privateDocuments: Array<Record<string, unknown>> = [];
 
       if (authorizedForPrivate) {
-        const [{ data: priv }, { data: docs }] = await Promise.all([
-          supabaseAdmin
-            .from('post_private_details')
-            .select('exact_handover_address, contact_phone, contact_note')
-            .eq('post_id', id)
-            .maybeSingle(),
-          supabaseAdmin
-            .from('private_documents')
-            .select('id, file_name, mime_type, size_bytes, storage_path, created_at')
-            .eq('post_id', id),
+        const [privSnap, docsSnap] = await Promise.all([
+          db.collection('post_private_details').doc(id).get(),
+          db.collection('private_documents').where('post_id', '==', id).get(),
         ]);
-
-        privateDetails = priv ?? null;
-        if (docs && docs.length > 0) {
-          privateDocuments = await Promise.all(
-            docs.map(async (doc) => {
-              const { data: signed } = await supabaseAdmin.storage
-                .from('private-documents')
-                .createSignedUrl(doc.storage_path, 900);
-              return {
-                id: doc.id,
-                file_name: doc.file_name,
-                mime_type: doc.mime_type,
-                size_bytes: doc.size_bytes,
-                signed_url: signed?.signedUrl ?? null,
-                created_at: doc.created_at,
-              };
-            })
-          );
-        }
+        privateDetails = privSnap.exists ? (privSnap.data() as Record<string, unknown>) : null;
+        privateDocuments = await Promise.all(
+          docsSnap.docs.map(async (d) => {
+            const docData = d.data();
+            return {
+              id: d.id,
+              file_name: docData.file_name,
+              mime_type: docData.mime_type,
+              size_bytes: docData.size_bytes,
+              signed_url: await getSignedReadUrl(String(docData.storage_path), 900),
+              created_at: docData.created_at,
+            };
+          })
+        );
       }
 
-      // Aggregate monetary pledged/confirmed summary without exposing personal donor details
       let monetarySummary: { pledged_total: number; confirmed_total: number } | null = null;
       if (post.donation_type === 'money') {
-        const { data: contribs } = await supabaseAdmin
-          .from('contributions')
-          .select('amount, status')
-          .eq('post_id', id)
-          .in('status', ['pledged', 'confirmed']);
+        const contribsSnap = await db
+          .collection('contributions')
+          .where('post_id', '==', id)
+          .where('status', 'in', ['pledged', 'confirmed'])
+          .get();
 
-        const pledgedTotal = (contribs ?? [])
-          .filter((c) => c.status === 'pledged')
-          .reduce((sum, c) => sum + Number(c.amount), 0);
-        const confirmedTotal = (contribs ?? [])
-          .filter((c) => c.status === 'confirmed')
-          .reduce((sum, c) => sum + Number(c.amount), 0);
+        const pledgedTotal = contribsSnap.docs
+          .filter((d) => d.data().status === 'pledged')
+          .reduce((sum, d) => sum + Number(d.data().amount || 0), 0);
+        const confirmedTotal = contribsSnap.docs
+          .filter((d) => d.data().status === 'confirmed')
+          .reduce((sum, d) => sum + Number(d.data().amount || 0), 0);
 
-        monetarySummary = {
-          pledged_total: pledgedTotal,
-          confirmed_total: confirmedTotal,
-        };
+        monetarySummary = { pledged_total: pledgedTotal, confirmed_total: confirmedTotal };
       }
 
       return {
         post: {
           ...post,
+          category: catSnap.exists ? { id: catSnap.id, ...catSnap.data() } : null,
+          author: authorSnap.exists
+            ? {
+                id: authorSnap.id,
+                full_name: authorSnap.data()?.full_name,
+                location_city: authorSnap.data()?.location_city ?? null,
+              }
+            : post.author,
           images: signedImages,
           monetary_summary: monetarySummary,
           can_view_private_details: authorizedForPrivate,
@@ -404,7 +382,6 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  // Update own post
   app.patch<{ Params: { id: string } }>(
     '/:id',
     {
@@ -426,15 +403,12 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         body.contact_note
       );
 
-      const { data: existing, error: fetchErr } = await supabaseAdmin
-        .from('posts')
-        .select('id, author_id, status, title')
-        .eq('id', id)
-        .single();
+      const db = getDb();
+      const postRef = db.collection('posts').doc(id);
+      const snap = await postRef.get();
+      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
 
-      if (fetchErr || !existing) {
-        throw new AppError(404, 'NOT_FOUND', 'Post not found');
-      }
+      const existing = snap.data()!;
       if (existing.author_id !== userId && request.authUser!.role !== 'admin') {
         throw new AppError(403, 'FORBIDDEN', 'You can only edit your own posts');
       }
@@ -442,7 +416,8 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(403, 'FORBIDDEN', 'Removed posts cannot be edited');
       }
 
-      const updateFields: Record<string, unknown> = {};
+      const now = new Date().toISOString();
+      const updateFields: Record<string, unknown> = { updated_at: now };
       if (body.title !== undefined) updateFields.title = sanitizeText(body.title);
       if (body.description !== undefined) updateFields.description = sanitizeText(body.description);
       if (body.quantity !== undefined) updateFields.quantity = body.quantity;
@@ -455,47 +430,41 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
       if (body.status !== undefined) updateFields.status = body.status;
       if (body.expires_at !== undefined) updateFields.expires_at = body.expires_at;
 
-      const { data: updated, error: updateErr } = await supabaseAdmin
-        .from('posts')
-        .update(updateFields)
-        .eq('id', id)
-        .select()
-        .single();
-
-      if (updateErr) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to update post');
-      }
+      await postRef.update(updateFields);
 
       if (
         body.exact_handover_address !== undefined ||
         body.contact_phone !== undefined ||
         body.contact_note !== undefined
       ) {
-        await supabaseAdmin.from('post_private_details').upsert({
-          post_id: id,
-          ...(body.exact_handover_address !== undefined
-            ? { exact_handover_address: body.exact_handover_address ? sanitizeText(body.exact_handover_address) : null }
-            : {}),
-          ...(body.contact_phone !== undefined
-            ? { contact_phone: body.contact_phone ? sanitizeText(body.contact_phone) : null }
-            : {}),
-          ...(body.contact_note !== undefined
-            ? { contact_note: body.contact_note ? sanitizeText(body.contact_note) : null }
-            : {}),
-        });
+        await db.collection('post_private_details').doc(id).set(
+          {
+            post_id: id,
+            updated_at: now,
+            ...(body.exact_handover_address !== undefined
+              ? { exact_handover_address: body.exact_handover_address ? sanitizeText(body.exact_handover_address) : null }
+              : {}),
+            ...(body.contact_phone !== undefined
+              ? { contact_phone: body.contact_phone ? sanitizeText(body.contact_phone) : null }
+              : {}),
+            ...(body.contact_note !== undefined
+              ? { contact_note: body.contact_note ? sanitizeText(body.contact_note) : null }
+              : {}),
+          },
+          { merge: true }
+        );
       }
 
-      // Notify active participants if status changed
       if (body.status && body.status !== existing.status) {
-        const { data: claims } = await supabaseAdmin
-          .from('claims')
-          .select('claimant_id')
-          .eq('post_id', id)
-          .in('status', ['pending', 'accepted']);
+        const claimsSnap = await db
+          .collection('claims')
+          .where('post_id', '==', id)
+          .where('status', 'in', ['pending', 'accepted'])
+          .get();
 
-        for (const c of claims ?? []) {
+        for (const c of claimsSnap.docs) {
           await createNotification({
-            userId: c.claimant_id,
+            userId: String(c.data().claimant_id),
             type: 'post_status_changed',
             title: 'Post status updated',
             body: `"${existing.title}" is now marked as ${body.status}.`,
@@ -504,11 +473,11 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         }
       }
 
-      return { post: updated };
+      const updatedSnap = await postRef.get();
+      return { post: { id: updatedSnap.id, ...updatedSnap.data() } };
     }
   );
 
-  // Delete own post
   app.delete<{ Params: { id: string } }>(
     '/:id',
     {
@@ -521,51 +490,40 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
+      const db = getDb();
+      const postRef = db.collection('posts').doc(id);
+      const snap = await postRef.get();
 
-      const { data: existing } = await supabaseAdmin
-        .from('posts')
-        .select('id, author_id')
-        .eq('id', id)
-        .single();
-
-      if (!existing) {
-        throw new AppError(404, 'NOT_FOUND', 'Post not found');
-      }
-      if (existing.author_id !== userId && request.authUser!.role !== 'admin') {
+      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
+      if (snap.data()!.author_id !== userId && request.authUser!.role !== 'admin') {
         throw new AppError(403, 'FORBIDDEN', 'You can only delete your own posts');
       }
 
-      const { error } = await supabaseAdmin.from('posts').delete().eq('id', id);
-      if (error) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to delete post');
-      }
-
+      await postRef.delete();
       return { success: true };
     }
   );
 
-  // Upload post image to private bucket
   app.post<{ Params: { id: string } }>(
     '/:id/images',
     {
       preHandler: [authenticate],
       schema: {
         tags: ['Posts'],
-        summary: 'Upload an image for a post (private storage, served via signed URL)',
+        summary: 'Upload an image for a post to private Firebase Storage',
       },
     },
     async (request, reply) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
+      const db = getDb();
+      const postRef = db.collection('posts').doc(id);
+      const postSnap = await postRef.get();
 
-      const { data: post } = await supabaseAdmin
-        .from('posts')
-        .select('id, author_id')
-        .eq('id', id)
-        .single();
-
-      if (!post) throw new AppError(404, 'NOT_FOUND', 'Post not found');
-      if (post.author_id !== userId) throw new AppError(403, 'FORBIDDEN', 'Only the post owner can upload images');
+      if (!postSnap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
+      if (postSnap.data()!.author_id !== userId) {
+        throw new AppError(403, 'FORBIDDEN', 'Only the post owner can upload images');
+      }
 
       const file = await request.file();
       if (!file) throw new AppError(400, 'BAD_REQUEST', 'No image file provided');
@@ -579,41 +537,32 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const ext = file.mimetype === 'image/png' ? 'png' : file.mimetype === 'image/webp' ? 'webp' : 'jpg';
-      const storagePath = `${userId}/${id}/${Date.now()}.${ext}`;
+      const imageId = `${Date.now()}`;
+      const storagePath = `post-images/${userId}/${id}/${imageId}.${ext}`;
 
-      const { error: uploadErr } = await supabaseAdmin.storage
-        .from('post-images')
-        .upload(storagePath, buffer, { contentType: file.mimetype });
+      await uploadBufferToStorage(storagePath, buffer, file.mimetype);
 
-      if (uploadErr) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to upload image');
-      }
-
-      const { data: imageRecord, error: dbErr } = await supabaseAdmin
-        .from('post_images')
-        .insert({ post_id: id, storage_path: storagePath })
-        .select()
-        .single();
-
-      if (dbErr || !imageRecord) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to save image metadata');
-      }
-
-      const { data: signed } = await supabaseAdmin.storage
-        .from('post-images')
-        .createSignedUrl(storagePath, 3600);
+      const existingImages = (postSnap.data()!.images as StoredImage[]) ?? [];
+      const newImage: StoredImage = {
+        id: imageId,
+        storage_path: storagePath,
+        sort_order: existingImages.length,
+      };
+      await postRef.update({
+        images: [...existingImages, newImage],
+        updated_at: new Date().toISOString(),
+      });
 
       return reply.status(201).send({
         image: {
-          id: imageRecord.id,
-          sort_order: imageRecord.sort_order,
-          url: signed?.signedUrl ?? null,
+          id: newImage.id,
+          sort_order: newImage.sort_order,
+          url: await getSignedReadUrl(storagePath),
         },
       });
     }
   );
 
-  // Upload private supporting document
   app.post<{ Params: { id: string } }>(
     '/:id/documents',
     {
@@ -626,15 +575,13 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
     async (request, reply) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
+      const db = getDb();
+      const postSnap = await db.collection('posts').doc(id).get();
 
-      const { data: post } = await supabaseAdmin
-        .from('posts')
-        .select('id, author_id')
-        .eq('id', id)
-        .single();
-
-      if (!post) throw new AppError(404, 'NOT_FOUND', 'Post not found');
-      if (post.author_id !== userId) throw new AppError(403, 'FORBIDDEN', 'Only the post owner can upload documents');
+      if (!postSnap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
+      if (postSnap.data()!.author_id !== userId) {
+        throw new AppError(403, 'FORBIDDEN', 'Only the post owner can upload documents');
+      }
 
       const file = await request.file();
       if (!file) throw new AppError(400, 'BAD_REQUEST', 'No document provided');
@@ -648,32 +595,22 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const safeName = file.filename.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 100);
-      const storagePath = `${userId}/${id}/${Date.now()}-${safeName}`;
+      const storagePath = `private-documents/${userId}/${id}/${Date.now()}-${safeName}`;
 
-      const { error: uploadErr } = await supabaseAdmin.storage
-        .from('private-documents')
-        .upload(storagePath, buffer, { contentType: file.mimetype });
+      await uploadBufferToStorage(storagePath, buffer, file.mimetype);
 
-      if (uploadErr) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to upload document');
-      }
-
-      const { data: docRecord, error: dbErr } = await supabaseAdmin
-        .from('private_documents')
-        .insert({
-          post_id: id,
-          uploader_id: userId,
-          storage_path: storagePath,
-          file_name: safeName,
-          mime_type: file.mimetype,
-          size_bytes: buffer.length,
-        })
-        .select()
-        .single();
-
-      if (dbErr || !docRecord) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to save document metadata');
-      }
+      const docRef = db.collection('private_documents').doc();
+      const docRecord = {
+        id: docRef.id,
+        post_id: id,
+        uploader_id: userId,
+        storage_path: storagePath,
+        file_name: safeName,
+        mime_type: file.mimetype,
+        size_bytes: buffer.length,
+        created_at: new Date().toISOString(),
+      };
+      await docRef.set(docRecord);
 
       return reply.status(201).send({ document: docRecord });
     }

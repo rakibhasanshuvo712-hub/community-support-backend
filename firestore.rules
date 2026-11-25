@@ -1,0 +1,890 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // This security rules file assumes the following data structures:
+    //
+    // 1. Collection: profiles
+    //    Document ID: {userId} (Firebase Auth UID)
+    //    Fields:
+    //      - id: string (optional, must equal userId, immutable)
+    //      - full_name: string (required, 2..120 chars)
+    //      - avatar_url: string | null (optional, valid http/https URL, <= 500 chars)
+    //      - bio: string | null (optional, <= 1000 chars)
+    //      - role: string (required, 'user' | 'admin', immutable for non-admins)
+    //      - is_suspended: bool (required, immutable for non-admins)
+    //      - suspended_reason: string | null (optional, <= 1000 chars, immutable for non-admins)
+    //      - preferred_language: string (required, 'en' | 'bn')
+    //      - location_city: string | null (optional, <= 100 chars)
+    //      - location_area: string | null (optional, <= 100 chars)
+    //      - created_at: timestamp (required, immutable)
+    //      - updated_at: timestamp (required)
+    //
+    // 2. Collection: profile_contacts
+    //    Document ID: {userId} (Firebase Auth UID)
+    //    Fields:
+    //      - user_id: string (optional, must equal userId, immutable)
+    //      - email: string | null (optional, valid email, <= 255 chars)
+    //      - phone: string | null (optional, <= 30 chars)
+    //      - exact_address: string | null (optional, <= 300 chars)
+    //      - updated_at: timestamp (required)
+    //
+    // 3. Collection: categories
+    //    Document ID: {categoryId}
+    //    Fields:
+    //      - id: string (optional, immutable)
+    //      - slug: string (required, 1..60 chars, ^[a-z0-9-]+$)
+    //      - name_en: string (required, 1..120 chars)
+    //      - name_bn: string (required, 1..120 chars)
+    //      - icon: string (required, 1..60 chars)
+    //      - is_restricted: bool (required)
+    //      - restriction_note_en: string | null (optional, <= 500 chars)
+    //      - restriction_note_bn: string | null (optional, <= 500 chars)
+    //      - sort_order: int (required, >= 0)
+    //      - created_at: timestamp (optional, immutable)
+    //
+    // 4. Collection: posts
+    //    Document ID: {postId}
+    //    Fields:
+    //      - id: string (optional, immutable)
+    //      - author_id: string (required, 1..128 chars, immutable)
+    //      - post_type: string (required, 'donation_offer' | 'help_request', immutable)
+    //      - donation_type: string (required, 'money' | 'item' | 'service', immutable)
+    //      - category_id: string (required, 1..128 chars)
+    //      - title: string (required, 5..180 chars)
+    //      - description: string (required, 10..5000 chars)
+    //      - quantity: number | null (optional, > 0)
+    //      - unit: string | null (optional, <= 40 chars)
+    //      - amount: number | null (optional, > 0)
+    //      - currency: string (required, 3..6 chars)
+    //      - location_city: string (required, 2..100 chars)
+    //      - location_area: string | null (optional, <= 100 chars)
+    //      - urgency: string (required, 'low' | 'medium' | 'high' | 'critical')
+    //      - status: string (required, 'active' | 'paused' | 'fulfilled' | 'closed' | 'removed')
+    //      - safety_acknowledged: bool (required)
+    //      - expires_at: timestamp | null (optional)
+    //      - view_count: int (required, >= 0)
+    //      - created_at: timestamp (required, immutable)
+    //      - updated_at: timestamp (required)
+    //
+    // 5. Collection: post_private_details
+    //    Document ID: {postId}
+    //    Fields:
+    //      - post_id: string (optional, must equal postId, immutable)
+    //      - exact_handover_address: string | null (optional, <= 300 chars)
+    //      - contact_phone: string | null (optional, <= 30 chars)
+    //      - contact_note: string | null (optional, <= 500 chars)
+    //      - accepted_participant_ids: list (optional, <= 100 UIDs)
+    //      - updated_at: timestamp (required)
+    //
+    // 6. Collection: private_documents
+    //    Document ID: {docId}
+    //    Fields:
+    //      - id: string (optional, immutable)
+    //      - post_id: string (required, 1..128 chars, immutable)
+    //      - uploader_id: string (required, 1..128 chars, immutable)
+    //      - storage_path: string (required, 1..500 chars)
+    //      - file_name: string (required, 1..255 chars)
+    //      - mime_type: string (required, 1..100 chars)
+    //      - size_bytes: int (required, 1..10485760)
+    //      - created_at: timestamp (required, immutable)
+    //
+    // 7. Collection: claims
+    //    Document ID: {claimId} (or deterministic {postId}_{claimantId})
+    //    Fields:
+    //      - id: string (optional, immutable)
+    //      - post_id: string (required, 1..128 chars, immutable)
+    //      - claimant_id: string (required, 1..128 chars, immutable)
+    //      - claim_type: string (required, 'offer_to_donate' | 'request_item', immutable)
+    //      - message: string | null (optional, <= 1000 chars)
+    //      - quantity_offered: number | null (optional, > 0)
+    //      - status: string (required, 'pending' | 'accepted' | 'rejected' | 'cancelled' | 'completed' | 'confirmed')
+    //      - donor_confirmed_handover: bool (required)
+    //      - recipient_confirmed_handover: bool (required)
+    //      - confirmed_at: timestamp | null (optional)
+    //      - created_at: timestamp (required, immutable)
+    //      - updated_at: timestamp (required)
+    //
+    // 8. Collection: contributions
+    //    Document ID: {contribId} (or deterministic {postId}_{contributorId})
+    //    Fields:
+    //      - id: string (optional, immutable)
+    //      - post_id: string (required, 1..128 chars, immutable)
+    //      - contributor_id: string (required, 1..128 chars, immutable)
+    //      - amount: number (required, > 0, immutable)
+    //      - currency: string (required, 3..6 chars, immutable)
+    //      - note: string | null (optional, <= 1000 chars)
+    //      - status: string (required, 'pledged' | 'confirmed' | 'cancelled')
+    //      - donor_confirmed: bool (required)
+    //      - recipient_confirmed: bool (required)
+    //      - confirmed_at: timestamp | null (optional)
+    //      - created_at: timestamp (required, immutable)
+    //      - updated_at: timestamp (required)
+    //
+    // 9. Collection: conversations
+    //    Document ID: {convId}
+    //    Fields:
+    //      - id: string (optional, immutable)
+    //      - post_id: string | null (optional, <= 128 chars, immutable)
+    //      - participant_ids: list (required, 2..10 UIDs, immutable)
+    //      - created_at: timestamp (required, immutable)
+    //      - updated_at: timestamp (required)
+    //
+    // 10. Subcollection: conversations/{convId}/messages/{msgId} & Top-level: messages/{msgId}
+    //     Fields:
+    //      - id: string (optional, immutable)
+    //      - conversation_id: string (required, 1..128 chars, immutable)
+    //      - sender_id: string (required, 1..128 chars, immutable)
+    //      - content: string (required, 1..3000 chars, immutable)
+    //      - is_read: bool (required)
+    //      - created_at: timestamp (required, immutable)
+    //
+    // 11. Collection: notifications
+    //     Document ID: {notifId}
+    //     Fields:
+    //      - id: string (optional, immutable)
+    //      - user_id: string (required, 1..128 chars, immutable)
+    //      - type: string (required, enum, immutable)
+    //      - title: string (required, 1..200 chars, immutable)
+    //      - body: string (required, 1..1000 chars, immutable)
+    //      - link: string | null (optional, <= 300 chars, immutable)
+    //      - is_read: bool (required)
+    //      - metadata: map (optional, <= 20 keys, immutable)
+    //      - created_at: timestamp (required, immutable)
+    //
+    // 12. Collection: reports
+    //     Document ID: {reportId}
+    //     Fields:
+    //      - id: string (optional, immutable)
+    //      - reporter_id: string (required, 1..128 chars, immutable)
+    //      - target_type: string (required, 'post' | 'user', immutable)
+    //      - target_post_id: string | null (optional, <= 128 chars, immutable)
+    //      - target_user_id: string | null (optional, <= 128 chars, immutable)
+    //      - reason: string (required, 3..150 chars, immutable)
+    //      - details: string | null (optional, <= 2000 chars, immutable)
+    //      - status: string (required, 'open' | 'reviewing' | 'resolved' | 'dismissed')
+    //      - resolved_by: string | null (optional, <= 128 chars)
+    //      - resolved_at: timestamp | null (optional)
+    //      - created_at: timestamp (required, immutable)
+    //
+    // 13. Collection: moderation_actions
+    //     Document ID: {actionId}
+    //     Fields:
+    //      - id: string (optional, immutable)
+    //      - admin_id: string (required, 1..128 chars, immutable)
+    //      - action_type: string (required, enum, immutable)
+    //      - target_user_id: string | null (optional, <= 128 chars, immutable)
+    //      - target_post_id: string | null (optional, <= 128 chars, immutable)
+    //      - report_id: string | null (optional, <= 128 chars, immutable)
+    //      - reason: string (required, 3..1000 chars, immutable)
+    //      - created_at: timestamp (required, immutable)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+             exists(/databases/$(database)/documents/profiles/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function hasRequiredFields(data, fields) {
+      return data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(data, fields) {
+      return data.keys().hasOnly(fields);
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    function validStringLength(data, field, minLen, maxLen) {
+      return data[field] is string &&
+             data[field].size() >= minLen &&
+             data[field].size() <= maxLen;
+    }
+
+    function isValidOptionalString(data, field, minLen, maxLen) {
+      return !(field in data) ||
+             data[field] == null ||
+             (data[field] is string &&
+              data[field].size() >= minLen &&
+              data[field].size() <= maxLen);
+    }
+
+    function isValidUrl(url) {
+      return url is string &&
+             (url.matches("^https://.*") || url.matches("^http://.*"));
+    }
+
+    function isValidOptionalUrl(data, field, maxLen) {
+      return !(field in data) ||
+             data[field] == null ||
+             (isValidUrl(data[field]) && data[field].size() <= maxLen);
+    }
+
+    function isValidEmail(email) {
+      return email is string &&
+             email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidOptionalEmail(data, field) {
+      return !(field in data) ||
+             data[field] == null ||
+             (isValidEmail(data[field]) && data[field].size() <= 255);
+    }
+
+    function isValidOptionalPositiveNumber(data, field) {
+      return !(field in data) ||
+             data[field] == null ||
+             (data[field] is number && data[field] > 0);
+    }
+
+    function isValidOptionalTimestamp(data, field) {
+      return !(field in data) ||
+             data[field] == null ||
+             data[field] is timestamp;
+    }
+
+    function isPostAuthor(postId) {
+      return isAuthenticated() &&
+             exists(/databases/$(database)/documents/posts/$(postId)) &&
+             get(/databases/$(database)/documents/posts/$(postId)).data.author_id == request.auth.uid;
+    }
+
+    function isAcceptedClaimant(postId) {
+      return isAuthenticated() &&
+             exists(/databases/$(database)/documents/claims/$(postId + "_" + request.auth.uid)) &&
+             get(/databases/$(database)/documents/claims/$(postId + "_" + request.auth.uid)).data.status in ['accepted', 'completed', 'confirmed'];
+    }
+
+    function isConfirmedContributor(postId) {
+      return isAuthenticated() &&
+             exists(/databases/$(database)/documents/contributions/$(postId + "_" + request.auth.uid)) &&
+             get(/databases/$(database)/documents/contributions/$(postId + "_" + request.auth.uid)).data.status == 'confirmed';
+    }
+
+    function isListedAcceptedParticipant(postId) {
+      return isAuthenticated() &&
+             exists(/databases/$(database)/documents/post_private_details/$(postId)) &&
+             ('accepted_participant_ids' in get(/databases/$(database)/documents/post_private_details/$(postId)).data) &&
+             (request.auth.uid in get(/databases/$(database)/documents/post_private_details/$(postId)).data.accepted_participant_ids);
+    }
+
+    function isAcceptedPostParticipant(postId) {
+      return isAcceptedClaimant(postId) ||
+             isConfirmedContributor(postId) ||
+             isListedAcceptedParticipant(postId);
+    }
+
+    function isConversationParticipant(convId) {
+      return isAuthenticated() &&
+             exists(/databases/$(database)/documents/conversations/$(convId)) &&
+             (request.auth.uid in get(/databases/$(database)/documents/conversations/$(convId)).data.participant_ids);
+    }
+
+    // ===============================================================
+    // Domain Validators (Used in BOTH create and update)
+    // ===============================================================
+
+    function isValidProfile(data, userId) {
+      let allowed = [
+        'id', 'full_name', 'avatar_url', 'bio', 'role',
+        'is_suspended', 'suspended_reason', 'preferred_language',
+        'location_city', 'location_area', 'created_at', 'updated_at'
+      ];
+      let required = [
+        'full_name', 'role', 'is_suspended', 'preferred_language',
+        'created_at', 'updated_at'
+      ];
+      return hasOnlyAllowedFields(data, allowed) &&
+             hasRequiredFields(data, required) &&
+             (!('id' in data) || data.id == userId) &&
+             validStringLength(data, 'full_name', 2, 120) &&
+             isValidOptionalUrl(data, 'avatar_url', 500) &&
+             isValidOptionalString(data, 'bio', 0, 1000) &&
+             data.role in ['user', 'admin'] &&
+             data.is_suspended is bool &&
+             isValidOptionalString(data, 'suspended_reason', 0, 1000) &&
+             data.preferred_language in ['en', 'bn'] &&
+             isValidOptionalString(data, 'location_city', 0, 100) &&
+             isValidOptionalString(data, 'location_area', 0, 100) &&
+             data.created_at is timestamp &&
+             data.updated_at is timestamp;
+    }
+
+    function isValidProfileContact(data, userId) {
+      let allowed = ['user_id', 'email', 'phone', 'exact_address', 'updated_at'];
+      let required = ['updated_at'];
+      return hasOnlyAllowedFields(data, allowed) &&
+             hasRequiredFields(data, required) &&
+             (!('user_id' in data) || data.user_id == userId) &&
+             isValidOptionalEmail(data, 'email') &&
+             isValidOptionalString(data, 'phone', 0, 30) &&
+             isValidOptionalString(data, 'exact_address', 0, 300) &&
+             data.updated_at is timestamp;
+    }
+
+    function isValidCategory(data) {
+      let allowed = [
+        'id', 'slug', 'name_en', 'name_bn', 'icon', 'is_restricted',
+        'restriction_note_en', 'restriction_note_bn', 'sort_order', 'created_at'
+      ];
+      let required = ['slug', 'name_en', 'name_bn', 'icon', 'is_restricted', 'sort_order'];
+      return hasOnlyAllowedFields(data, allowed) &&
+             hasRequiredFields(data, required) &&
+             isValidOptionalString(data, 'id', 1, 128) &&
+             validStringLength(data, 'slug', 1, 60) &&
+             data.slug.matches("^[a-z0-9-]+$") &&
+             validStringLength(data, 'name_en', 1, 120) &&
+             validStringLength(data, 'name_bn', 1, 120) &&
+             validStringLength(data, 'icon', 1, 60) &&
+             data.is_restricted is bool &&
+             isValidOptionalString(data, 'restriction_note_en', 0, 500) &&
+             isValidOptionalString(data, 'restriction_note_bn', 0, 500) &&
+             data.sort_order is int &&
+             data.sort_order >= 0 &&
+             isValidOptionalTimestamp(data, 'created_at');
+    }
+
+    function isValidPost(data) {
+      let allowed = [
+        'id', 'author_id', 'post_type', 'donation_type', 'category_id',
+        'title', 'description', 'quantity', 'unit', 'amount', 'currency',
+        'location_city', 'location_area', 'urgency', 'status',
+        'safety_acknowledged', 'expires_at', 'view_count',
+        'created_at', 'updated_at'
+      ];
+      let required = [
+        'author_id', 'post_type', 'donation_type', 'category_id',
+        'title', 'description', 'currency', 'location_city',
+        'urgency', 'status', 'safety_acknowledged', 'view_count',
+        'created_at', 'updated_at'
+      ];
+      return hasOnlyAllowedFields(data, allowed) &&
+             hasRequiredFields(data, required) &&
+             isValidOptionalString(data, 'id', 1, 128) &&
+             validStringLength(data, 'author_id', 1, 128) &&
+             data.post_type in ['donation_offer', 'help_request'] &&
+             data.donation_type in ['money', 'item', 'service'] &&
+             validStringLength(data, 'category_id', 1, 128) &&
+             validStringLength(data, 'title', 5, 180) &&
+             validStringLength(data, 'description', 10, 5000) &&
+             isValidOptionalPositiveNumber(data, 'quantity') &&
+             isValidOptionalString(data, 'unit', 0, 40) &&
+             isValidOptionalPositiveNumber(data, 'amount') &&
+             validStringLength(data, 'currency', 3, 6) &&
+             validStringLength(data, 'location_city', 2, 100) &&
+             isValidOptionalString(data, 'location_area', 0, 100) &&
+             data.urgency in ['low', 'medium', 'high', 'critical'] &&
+             data.status in ['active', 'paused', 'fulfilled', 'closed', 'removed'] &&
+             data.safety_acknowledged is bool &&
+             isValidOptionalTimestamp(data, 'expires_at') &&
+             data.view_count is int &&
+             data.view_count >= 0 &&
+             data.created_at is timestamp &&
+             data.updated_at is timestamp;
+    }
+
+    function isValidPostPrivateDetails(data, postId) {
+      let allowed = [
+        'post_id', 'exact_handover_address', 'contact_phone',
+        'contact_note', 'accepted_participant_ids', 'updated_at'
+      ];
+      let required = ['updated_at'];
+      return hasOnlyAllowedFields(data, allowed) &&
+             hasRequiredFields(data, required) &&
+             (!('post_id' in data) || data.post_id == postId) &&
+             isValidOptionalString(data, 'exact_handover_address', 0, 300) &&
+             isValidOptionalString(data, 'contact_phone', 0, 30) &&
+             isValidOptionalString(data, 'contact_note', 0, 500) &&
+             (!('accepted_participant_ids' in data) ||
+              (data.accepted_participant_ids is list &&
+               data.accepted_participant_ids.size() <= 100)) &&
+             data.updated_at is timestamp;
+    }
+
+    function isValidPrivateDocument(data) {
+      let allowed = [
+        'id', 'post_id', 'uploader_id', 'storage_path',
+        'file_name', 'mime_type', 'size_bytes', 'created_at'
+      ];
+      let required = [
+        'post_id', 'uploader_id', 'storage_path',
+        'file_name', 'mime_type', 'size_bytes', 'created_at'
+      ];
+      return hasOnlyAllowedFields(data, allowed) &&
+             hasRequiredFields(data, required) &&
+             isValidOptionalString(data, 'id', 1, 128) &&
+             validStringLength(data, 'post_id', 1, 128) &&
+             validStringLength(data, 'uploader_id', 1, 128) &&
+             validStringLength(data, 'storage_path', 1, 500) &&
+             validStringLength(data, 'file_name', 1, 255) &&
+             validStringLength(data, 'mime_type', 1, 100) &&
+             data.size_bytes is int &&
+             data.size_bytes > 0 &&
+             data.size_bytes <= 10485760 &&
+             data.created_at is timestamp;
+    }
+
+    function isValidClaim(data) {
+      let allowed = [
+        'id', 'post_id', 'claimant_id', 'claim_type', 'message',
+        'quantity_offered', 'status', 'donor_confirmed_handover',
+        'recipient_confirmed_handover', 'confirmed_at',
+        'created_at', 'updated_at'
+      ];
+      let required = [
+        'post_id', 'claimant_id', 'claim_type', 'status',
+        'donor_confirmed_handover', 'recipient_confirmed_handover',
+        'created_at', 'updated_at'
+      ];
+      return hasOnlyAllowedFields(data, allowed) &&
+             hasRequiredFields(data, required) &&
+             isValidOptionalString(data, 'id', 1, 128) &&
+             validStringLength(data, 'post_id', 1, 128) &&
+             validStringLength(data, 'claimant_id', 1, 128) &&
+             data.claim_type in ['offer_to_donate', 'request_item'] &&
+             isValidOptionalString(data, 'message', 0, 1000) &&
+             isValidOptionalPositiveNumber(data, 'quantity_offered') &&
+             data.status in ['pending', 'accepted', 'rejected', 'cancelled', 'completed', 'confirmed'] &&
+             data.donor_confirmed_handover is bool &&
+             data.recipient_confirmed_handover is bool &&
+             (!(data.status in ['completed', 'confirmed']) ||
+              (data.donor_confirmed_handover == true && data.recipient_confirmed_handover == true)) &&
+             isValidOptionalTimestamp(data, 'confirmed_at') &&
+             data.created_at is timestamp &&
+             data.updated_at is timestamp;
+    }
+
+    function isValidContribution(data) {
+      let allowed = [
+        'id', 'post_id', 'contributor_id', 'amount', 'currency',
+        'note', 'status', 'donor_confirmed', 'recipient_confirmed',
+        'confirmed_at', 'created_at', 'updated_at'
+      ];
+      let required = [
+        'post_id', 'contributor_id', 'amount', 'currency',
+        'status', 'donor_confirmed', 'recipient_confirmed',
+        'created_at', 'updated_at'
+      ];
+      return hasOnlyAllowedFields(data, allowed) &&
+             hasRequiredFields(data, required) &&
+             isValidOptionalString(data, 'id', 1, 128) &&
+             validStringLength(data, 'post_id', 1, 128) &&
+             validStringLength(data, 'contributor_id', 1, 128) &&
+             data.amount is number &&
+             data.amount > 0 &&
+             validStringLength(data, 'currency', 3, 6) &&
+             isValidOptionalString(data, 'note', 0, 1000) &&
+             data.status in ['pledged', 'confirmed', 'cancelled'] &&
+             data.donor_confirmed is bool &&
+             data.recipient_confirmed is bool &&
+             (data.status != 'confirmed' ||
+              (data.donor_confirmed == true && data.recipient_confirmed == true)) &&
+             isValidOptionalTimestamp(data, 'confirmed_at') &&
+             data.created_at is timestamp &&
+             data.updated_at is timestamp;
+    }
+
+    function isValidConversation(data) {
+      let allowed = ['id', 'post_id', 'participant_ids', 'created_at', 'updated_at'];
+      let required = ['participant_ids', 'created_at', 'updated_at'];
+      return hasOnlyAllowedFields(data, allowed) &&
+             hasRequiredFields(data, required) &&
+             isValidOptionalString(data, 'id', 1, 128) &&
+             isValidOptionalString(data, 'post_id', 1, 128) &&
+             data.participant_ids is list &&
+             data.participant_ids.size() >= 2 &&
+             data.participant_ids.size() <= 10 &&
+             data.participant_ids[0] is string &&
+             data.participant_ids[0].size() >= 1 &&
+             data.participant_ids[0].size() <= 128 &&
+             data.participant_ids[1] is string &&
+             data.participant_ids[1].size() >= 1 &&
+             data.participant_ids[1].size() <= 128 &&
+             data.created_at is timestamp &&
+             data.updated_at is timestamp;
+    }
+
+    function isValidMessage(data) {
+      let allowed = ['id', 'conversation_id', 'sender_id', 'content', 'is_read', 'created_at'];
+      let required = ['conversation_id', 'sender_id', 'content', 'is_read', 'created_at'];
+      return hasOnlyAllowedFields(data, allowed) &&
+             hasRequiredFields(data, required) &&
+             isValidOptionalString(data, 'id', 1, 128) &&
+             validStringLength(data, 'conversation_id', 1, 128) &&
+             validStringLength(data, 'sender_id', 1, 128) &&
+             validStringLength(data, 'content', 1, 3000) &&
+             data.is_read is bool &&
+             data.created_at is timestamp;
+    }
+
+    function isValidNotification(data) {
+      let allowed = [
+        'id', 'user_id', 'type', 'title', 'body',
+        'link', 'is_read', 'metadata', 'created_at'
+      ];
+      let required = ['user_id', 'type', 'title', 'body', 'is_read', 'created_at'];
+      return hasOnlyAllowedFields(data, allowed) &&
+             hasRequiredFields(data, required) &&
+             isValidOptionalString(data, 'id', 1, 128) &&
+             validStringLength(data, 'user_id', 1, 128) &&
+             data.type in [
+               'new_offer', 'new_request', 'offer_accepted', 'offer_rejected',
+               'new_message', 'contribution_confirmed', 'post_status_changed', 'moderation'
+             ] &&
+             validStringLength(data, 'title', 1, 200) &&
+             validStringLength(data, 'body', 1, 1000) &&
+             isValidOptionalString(data, 'link', 0, 300) &&
+             data.is_read is bool &&
+             (!('metadata' in data) || (data.metadata is map && data.metadata.keys().size() <= 20)) &&
+             data.created_at is timestamp;
+    }
+
+    function isValidReport(data) {
+      let allowed = [
+        'id', 'reporter_id', 'target_type', 'target_post_id',
+        'target_user_id', 'reason', 'details', 'status',
+        'resolved_by', 'resolved_at', 'created_at'
+      ];
+      let required = ['reporter_id', 'target_type', 'reason', 'status', 'created_at'];
+      return hasOnlyAllowedFields(data, allowed) &&
+             hasRequiredFields(data, required) &&
+             isValidOptionalString(data, 'id', 1, 128) &&
+             validStringLength(data, 'reporter_id', 1, 128) &&
+             data.target_type in ['post', 'user'] &&
+             isValidOptionalString(data, 'target_post_id', 1, 128) &&
+             isValidOptionalString(data, 'target_user_id', 1, 128) &&
+             ((data.target_type == 'post' && ('target_post_id' in data) && data.target_post_id != null) ||
+              (data.target_type == 'user' && ('target_user_id' in data) && data.target_user_id != null)) &&
+             validStringLength(data, 'reason', 3, 150) &&
+             isValidOptionalString(data, 'details', 0, 2000) &&
+             data.status in ['open', 'reviewing', 'resolved', 'dismissed'] &&
+             isValidOptionalString(data, 'resolved_by', 1, 128) &&
+             isValidOptionalTimestamp(data, 'resolved_at') &&
+             data.created_at is timestamp;
+    }
+
+    function isValidModerationAction(data) {
+      let allowed = [
+        'id', 'admin_id', 'action_type', 'target_user_id',
+        'target_post_id', 'report_id', 'reason', 'created_at'
+      ];
+      let required = ['admin_id', 'action_type', 'reason', 'created_at'];
+      return hasOnlyAllowedFields(data, allowed) &&
+             hasRequiredFields(data, required) &&
+             isValidOptionalString(data, 'id', 1, 128) &&
+             validStringLength(data, 'admin_id', 1, 128) &&
+             data.action_type in [
+               'suspend_user', 'unsuspend_user', 'remove_post',
+               'restore_post', 'resolve_report', 'dismiss_report'
+             ] &&
+             isValidOptionalString(data, 'target_user_id', 1, 128) &&
+             isValidOptionalString(data, 'target_post_id', 1, 128) &&
+             isValidOptionalString(data, 'report_id', 1, 128) &&
+             validStringLength(data, 'reason', 3, 1000) &&
+             data.created_at is timestamp;
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // 1. Profiles (publicly safe metadata; no PII)
+    match /profiles/{userId} {
+      allow read: if isOwner(userId) ||
+                     isAdmin() ||
+                     (resource != null && resource.data.is_suspended == false);
+
+      allow create: if isValidProfile(request.resource.data, userId) &&
+                       (
+                         (isOwner(userId) &&
+                          request.resource.data.role == 'user' &&
+                          request.resource.data.is_suspended == false &&
+                          (!('suspended_reason' in request.resource.data) ||
+                           request.resource.data.suspended_reason == null)) ||
+                         isAdmin()
+                       );
+
+      allow update: if isValidProfile(request.resource.data, userId) &&
+                       areImmutableFieldsUnchanged(['id', 'created_at']) &&
+                       (
+                         (isOwner(userId) &&
+                          areImmutableFieldsUnchanged(['role', 'is_suspended', 'suspended_reason'])) ||
+                         isAdmin()
+                       );
+
+      allow delete: if false;
+    }
+
+    // 2. Profile Contacts (strictly private PII)
+    match /profile_contacts/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if (isOwner(userId) || isAdmin()) &&
+                       isValidProfileContact(request.resource.data, userId);
+      allow update: if (isOwner(userId) || isAdmin()) &&
+                       isValidProfileContact(request.resource.data, userId) &&
+                       areImmutableFieldsUnchanged(['user_id']);
+      allow delete: if isOwner(userId) || isAdmin();
+    }
+
+    // 3. Categories (public read; admin-only write)
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow create: if isAdmin() && isValidCategory(request.resource.data);
+      allow update: if isAdmin() &&
+                       isValidCategory(request.resource.data) &&
+                       areImmutableFieldsUnchanged(['id', 'created_at']);
+      allow delete: if isAdmin();
+    }
+
+    // 4. Posts (donation offers and help requests)
+    match /posts/{postId} {
+      allow read: if (resource != null && resource.data.status in ['active', 'fulfilled']) ||
+                     (isAuthenticated() && resource != null && resource.data.author_id == request.auth.uid) ||
+                     isAdmin();
+
+      allow create: if isAuthenticated() &&
+                       request.resource.data.author_id == request.auth.uid &&
+                       request.resource.data.status == 'active' &&
+                       request.resource.data.view_count == 0 &&
+                       isValidPost(request.resource.data);
+
+      allow update: if isValidPost(request.resource.data) &&
+                       areImmutableFieldsUnchanged(['id', 'author_id', 'post_type', 'donation_type', 'created_at']) &&
+                       (
+                         (isAuthenticated() &&
+                          resource.data.author_id == request.auth.uid &&
+                          request.resource.data.status != 'removed') ||
+                         isAdmin()
+                       );
+
+      allow delete: if (isAuthenticated() && resource.data.author_id == request.auth.uid) ||
+                       isAdmin();
+    }
+
+    // 5a. Post Private Handover Details
+    match /post_private_details/{postId} {
+      allow read: if isPostAuthor(postId) ||
+                     isAdmin() ||
+                     isAcceptedPostParticipant(postId) ||
+                     (isAuthenticated() &&
+                      resource != null &&
+                      ('accepted_participant_ids' in resource.data) &&
+                      (request.auth.uid in resource.data.accepted_participant_ids));
+
+      allow create: if isPostAuthor(postId) &&
+                       isValidPostPrivateDetails(request.resource.data, postId);
+
+      allow update: if isPostAuthor(postId) &&
+                       isValidPostPrivateDetails(request.resource.data, postId) &&
+                       areImmutableFieldsUnchanged(['post_id']);
+
+      allow delete: if isPostAuthor(postId);
+    }
+
+    // 5b. Private Supporting Documents
+    match /private_documents/{docId} {
+      allow read: if (resource != null && isPostAuthor(resource.data.post_id)) ||
+                     (resource != null && isAcceptedPostParticipant(resource.data.post_id)) ||
+                     isAdmin();
+
+      allow create: if isPostAuthor(request.resource.data.post_id) &&
+                       request.resource.data.uploader_id == request.auth.uid &&
+                       isValidPrivateDocument(request.resource.data);
+
+      allow update: if isPostAuthor(resource.data.post_id) &&
+                       isValidPrivateDocument(request.resource.data) &&
+                       areImmutableFieldsUnchanged(['id', 'post_id', 'uploader_id', 'created_at']);
+
+      allow delete: if isPostAuthor(resource.data.post_id);
+    }
+
+    // 6a. Claims (item & service offers/requests)
+    match /claims/{claimId} {
+      allow read: if isAuthenticated() &&
+                     (resource.data.claimant_id == request.auth.uid ||
+                      isPostAuthor(resource.data.post_id) ||
+                      isAdmin());
+
+      allow create: if isAuthenticated() &&
+                       request.resource.data.claimant_id == request.auth.uid &&
+                       request.resource.data.status == 'pending' &&
+                       request.resource.data.donor_confirmed_handover == false &&
+                       request.resource.data.recipient_confirmed_handover == false &&
+                       exists(/databases/$(database)/documents/posts/$(request.resource.data.post_id)) &&
+                       isValidClaim(request.resource.data);
+
+      allow update: if isAuthenticated() &&
+                       isValidClaim(request.resource.data) &&
+                       areImmutableFieldsUnchanged(['id', 'post_id', 'claimant_id', 'claim_type', 'created_at']) &&
+                       (
+                         isAdmin() ||
+                         (
+                           (resource.data.claimant_id == request.auth.uid || isPostAuthor(resource.data.post_id)) &&
+                           (!(request.resource.data.status in ['completed', 'confirmed']) ||
+                            (request.resource.data.donor_confirmed_handover == true &&
+                             request.resource.data.recipient_confirmed_handover == true))
+                         )
+                       );
+
+      allow delete: if isAdmin();
+    }
+
+    // 6b. Monetary Contributions (direct pledges; platform never holds funds)
+    match /contributions/{contribId} {
+      allow read: if isAuthenticated() &&
+                     (resource.data.contributor_id == request.auth.uid ||
+                      isPostAuthor(resource.data.post_id) ||
+                      isAdmin());
+
+      allow create: if isAuthenticated() &&
+                       request.resource.data.contributor_id == request.auth.uid &&
+                       request.resource.data.status == 'pledged' &&
+                       request.resource.data.donor_confirmed == false &&
+                       request.resource.data.recipient_confirmed == false &&
+                       exists(/databases/$(database)/documents/posts/$(request.resource.data.post_id)) &&
+                       isValidContribution(request.resource.data);
+
+      allow update: if isAuthenticated() &&
+                       isValidContribution(request.resource.data) &&
+                       areImmutableFieldsUnchanged(['id', 'post_id', 'contributor_id', 'amount', 'currency', 'created_at']) &&
+                       (
+                         isAdmin() ||
+                         (
+                           (
+                             (resource.data.contributor_id == request.auth.uid &&
+                              request.resource.data.recipient_confirmed == resource.data.recipient_confirmed) ||
+                             (isPostAuthor(resource.data.post_id) &&
+                              request.resource.data.donor_confirmed == resource.data.donor_confirmed)
+                           ) &&
+                           (request.resource.data.status != 'confirmed' ||
+                            (request.resource.data.donor_confirmed == true &&
+                             request.resource.data.recipient_confirmed == true))
+                         )
+                       );
+
+      allow delete: if isAdmin();
+    }
+
+    // 7a. Conversations & Nested Messages
+    match /conversations/{convId} {
+      allow read: if isAuthenticated() &&
+                     (request.auth.uid in resource.data.participant_ids);
+
+      allow create: if isAuthenticated() &&
+                       (request.auth.uid in request.resource.data.participant_ids) &&
+                       isValidConversation(request.resource.data);
+
+      allow update: if isAuthenticated() &&
+                       (request.auth.uid in resource.data.participant_ids) &&
+                       isValidConversation(request.resource.data) &&
+                       areImmutableFieldsUnchanged(['id', 'post_id', 'participant_ids', 'created_at']);
+
+      allow delete: if false;
+
+      match /messages/{msgId} {
+        allow read: if isConversationParticipant(convId);
+
+        allow create: if isConversationParticipant(convId) &&
+                         request.resource.data.conversation_id == convId &&
+                         request.resource.data.sender_id == request.auth.uid &&
+                         isValidMessage(request.resource.data);
+
+        allow update: if isConversationParticipant(convId) &&
+                         isValidMessage(request.resource.data) &&
+                         areImmutableFieldsUnchanged(['id', 'conversation_id', 'sender_id', 'content', 'created_at']);
+
+        allow delete: if false;
+      }
+    }
+
+    // 7b. Top-level Messages (linked via conversation_id)
+    match /messages/{msgId} {
+      allow read: if isConversationParticipant(resource.data.conversation_id);
+
+      allow create: if isConversationParticipant(request.resource.data.conversation_id) &&
+                       request.resource.data.sender_id == request.auth.uid &&
+                       isValidMessage(request.resource.data);
+
+      allow update: if isConversationParticipant(resource.data.conversation_id) &&
+                       isValidMessage(request.resource.data) &&
+                       areImmutableFieldsUnchanged(['id', 'conversation_id', 'sender_id', 'content', 'created_at']);
+
+      allow delete: if false;
+    }
+
+    // 8. Notifications (recipient read and is_read-only update)
+    match /notifications/{notifId} {
+      allow read: if isAuthenticated() && resource.data.user_id == request.auth.uid;
+
+      allow create: if isAdmin() && isValidNotification(request.resource.data);
+
+      allow update: if isAuthenticated() &&
+                       resource.data.user_id == request.auth.uid &&
+                       request.resource.data.diff(resource.data).affectedKeys().hasOnly(['is_read']) &&
+                       isValidNotification(request.resource.data);
+
+      allow delete: if false;
+    }
+
+    // 9. Reports
+    match /reports/{reportId} {
+      allow read: if isAuthenticated() &&
+                     (resource.data.reporter_id == request.auth.uid || isAdmin());
+
+      allow create: if isAuthenticated() &&
+                       request.resource.data.reporter_id == request.auth.uid &&
+                       request.resource.data.status == 'open' &&
+                       (!('resolved_by' in request.resource.data) || request.resource.data.resolved_by == null) &&
+                       (!('resolved_at' in request.resource.data) || request.resource.data.resolved_at == null) &&
+                       isValidReport(request.resource.data);
+
+      allow update: if isAdmin() &&
+                       isValidReport(request.resource.data) &&
+                       areImmutableFieldsUnchanged([
+                         'id', 'reporter_id', 'target_type', 'target_post_id',
+                         'target_user_id', 'reason', 'details', 'created_at'
+                       ]);
+
+      allow delete: if false;
+    }
+
+    // 10. Moderation Actions (admin read/create only)
+    match /moderation_actions/{actionId} {
+      allow read: if isAdmin();
+
+      allow create: if isAdmin() &&
+                       request.resource.data.admin_id == request.auth.uid &&
+                       isValidModerationAction(request.resource.data);
+
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ===============================================================
+    // Default Deny-All Fallback
+    // ===============================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

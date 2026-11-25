@@ -3,7 +3,7 @@ import { z } from 'zod';
 export const createPostSchema = z.object({
   post_type: z.enum(['donation_offer', 'help_request']),
   donation_type: z.enum(['money', 'item', 'service']),
-  category_id: z.string().uuid(),
+  category_id: z.string().trim().min(1).max(128),
   title: z.string().trim().min(5).max(180),
   description: z.string().trim().min(10).max(5000),
   quantity: z.coerce.number().positive().nullable().optional(),
@@ -39,7 +39,7 @@ export const updatePostSchema = z.object({
 
 export const listPostsQuerySchema = z.object({
   q: z.string().trim().max(120).optional(),
-  category_id: z.string().uuid().optional(),
+  category_id: z.string().trim().min(1).max(128).optional(),
   category_slug: z.string().trim().max(60).optional(),
   post_type: z.enum(['donation_offer', 'help_request']).optional(),
   donation_type: z.enum(['money', 'item', 'service']).optional(),

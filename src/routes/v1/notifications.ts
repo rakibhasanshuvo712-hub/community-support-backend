@@ -1,6 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { AppError } from '../../lib/errors.js';
-import { supabaseAdmin } from '../../lib/supabase.js';
+import { getDb } from '../../lib/firebase.js';
 import { authenticate } from '../../middleware/auth.js';
 
 export async function notificationRoutes(app: FastifyInstance): Promise<void> {
@@ -15,19 +14,17 @@ export async function notificationRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const { data, error } = await supabaseAdmin
-        .from('notifications')
-        .select('*')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false })
-        .limit(50);
+      const snap = await getDb()
+        .collection('notifications')
+        .where('user_id', '==', userId)
+        .orderBy('created_at', 'desc')
+        .limit(50)
+        .get();
 
-      if (error) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to fetch notifications');
-      }
+      const notifications = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Record<string, unknown>));
+      const unreadCount = notifications.filter((n) => !n.is_read).length;
 
-      const unreadCount = (data ?? []).filter((n) => !n.is_read).length;
-      return { notifications: data ?? [], unread_count: unreadCount };
+      return { notifications, unread_count: unreadCount };
     }
   );
 
@@ -43,17 +40,12 @@ export async function notificationRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
+      const ref = getDb().collection('notifications').doc(id);
+      const snap = await ref.get();
 
-      const { error } = await supabaseAdmin
-        .from('notifications')
-        .update({ is_read: true })
-        .eq('id', id)
-        .eq('user_id', userId);
-
-      if (error) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to mark notification as read');
+      if (snap.exists && snap.data()?.user_id === userId) {
+        await ref.update({ is_read: true });
       }
-
       return { success: true };
     }
   );
@@ -69,15 +61,19 @@ export async function notificationRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
+      const db = getDb();
+      const snap = await db
+        .collection('notifications')
+        .where('user_id', '==', userId)
+        .where('is_read', '==', false)
+        .get();
 
-      const { error } = await supabaseAdmin
-        .from('notifications')
-        .update({ is_read: true })
-        .eq('user_id', userId)
-        .eq('is_read', false);
-
-      if (error) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to mark notifications as read');
+      if (!snap.empty) {
+        const batch = db.batch();
+        for (const d of snap.docs) {
+          batch.update(d.ref, { is_read: true });
+        }
+        await batch.commit();
       }
 
       return { success: true };

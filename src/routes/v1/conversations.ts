@@ -1,22 +1,23 @@
 import type { FastifyInstance } from 'fastify';
 import { AppError } from '../../lib/errors.js';
+import { getDb } from '../../lib/firebase.js';
 import { assertNoSensitiveFinancialData, sanitizeText } from '../../lib/security.js';
-import { supabaseAdmin } from '../../lib/supabase.js';
 import { authenticate } from '../../middleware/auth.js';
 import { createConversationSchema, sendMessageSchema } from '../../schemas/interactions.schema.js';
 import { createNotification } from '../../services/notifications.service.js';
 
-async function assertParticipant(conversationId: string, userId: string): Promise<void> {
-  const { data } = await supabaseAdmin
-    .from('conversation_participants')
-    .select('conversation_id')
-    .eq('conversation_id', conversationId)
-    .eq('user_id', userId)
-    .maybeSingle();
-
-  if (!data) {
+async function assertParticipant(conversationId: string, userId: string): Promise<FirebaseFirestore.DocumentData> {
+  const db = getDb();
+  const convSnap = await db.collection('conversations').doc(conversationId).get();
+  if (!convSnap.exists) {
+    throw new AppError(404, 'NOT_FOUND', 'Conversation not found');
+  }
+  const data = convSnap.data()!;
+  const participants = (data.participant_ids as string[]) ?? [];
+  if (!participants.includes(userId)) {
     throw new AppError(403, 'FORBIDDEN', 'You are not a participant in this conversation');
   }
+  return data;
 }
 
 export async function conversationRoutes(app: FastifyInstance): Promise<void> {
@@ -31,63 +32,76 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
+      const db = getDb();
 
-      const { data: memberships, error } = await supabaseAdmin
-        .from('conversation_participants')
-        .select('conversation_id, last_read_at')
-        .eq('user_id', userId);
+      const snap = await db
+        .collection('conversations')
+        .where('participant_ids', 'array-contains', userId)
+        .orderBy('updated_at', 'desc')
+        .get();
 
-      if (error) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to load conversations');
-      }
+      const conversations = await Promise.all(
+        snap.docs.map(async (doc) => {
+          const conv = doc.data();
+          const participantIds = (conv.participant_ids as string[]) ?? [];
 
-      const convIds = (memberships ?? []).map((m) => m.conversation_id);
-      if (convIds.length === 0) {
-        return { conversations: [] };
-      }
-
-      const { data: conversations } = await supabaseAdmin
-        .from('conversations')
-        .select(
-          `
-          id, post_id, created_at, updated_at,
-          post:posts(id, title, post_type, status),
-          participants:conversation_participants(
-            user_id, last_read_at,
-            profile:profiles(id, full_name, avatar_url)
-          )
-        `
-        )
-        .in('id', convIds)
-        .order('updated_at', { ascending: false });
-
-      const enriched = await Promise.all(
-        (conversations ?? []).map(async (conv) => {
-          const [{ data: lastMsg }, { count: unreadCount }] = await Promise.all([
-            supabaseAdmin
-              .from('messages')
-              .select('id, sender_id, content, created_at, is_read')
-              .eq('conversation_id', conv.id)
-              .order('created_at', { ascending: false })
+          const [participants, postSnap, lastMsgSnap, unreadSnap] = await Promise.all([
+            Promise.all(
+              participantIds.map(async (uid) => {
+                const pSnap = await db.collection('profiles').doc(uid).get();
+                return {
+                  user_id: uid,
+                  profile: {
+                    id: uid,
+                    full_name: pSnap.exists ? pSnap.data()?.full_name : 'User',
+                    avatar_url: pSnap.exists ? pSnap.data()?.avatar_url ?? null : null,
+                  },
+                };
+              })
+            ),
+            conv.post_id ? db.collection('posts').doc(String(conv.post_id)).get() : Promise.resolve(null),
+            db
+              .collection('conversations')
+              .doc(doc.id)
+              .collection('messages')
+              .orderBy('created_at', 'desc')
               .limit(1)
-              .maybeSingle(),
-            supabaseAdmin
-              .from('messages')
-              .select('id', { count: 'exact', head: true })
-              .eq('conversation_id', conv.id)
-              .neq('sender_id', userId)
-              .eq('is_read', false),
+              .get(),
+            db
+              .collection('conversations')
+              .doc(doc.id)
+              .collection('messages')
+              .where('is_read', '==', false)
+              .get(),
           ]);
 
+          const lastMessage = lastMsgSnap.empty
+            ? null
+            : { id: lastMsgSnap.docs[0]!.id, ...lastMsgSnap.docs[0]!.data() };
+
+          const unreadCount = unreadSnap.docs.filter((m) => m.data().sender_id !== userId).length;
+
           return {
-            ...conv,
-            last_message: lastMsg ?? null,
-            unread_count: unreadCount ?? 0,
+            id: doc.id,
+            post_id: conv.post_id ?? null,
+            created_at: conv.created_at,
+            updated_at: conv.updated_at,
+            post: postSnap && postSnap.exists
+              ? {
+                  id: postSnap.id,
+                  title: postSnap.data()?.title,
+                  post_type: postSnap.data()?.post_type,
+                  status: postSnap.data()?.status,
+                }
+              : null,
+            participants,
+            last_message: lastMessage,
+            unread_count: unreadCount,
           };
         })
       );
 
-      return { conversations: enriched };
+      return { conversations };
     }
   );
 
@@ -110,69 +124,49 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
 
       assertNoSensitiveFinancialData(body.initial_message);
 
-      const { data: recipient } = await supabaseAdmin
-        .from('profiles')
-        .select('id, is_suspended')
-        .eq('id', body.recipient_id)
-        .single();
-
-      if (!recipient || recipient.is_suspended) {
+      const db = getDb();
+      const recipientSnap = await db.collection('profiles').doc(body.recipient_id).get();
+      if (!recipientSnap.exists || recipientSnap.data()?.is_suspended) {
         throw new AppError(404, 'NOT_FOUND', 'Recipient not found');
       }
 
-      // Check if conversation already exists between these two users (optionally for same post)
-      const { data: myConvs } = await supabaseAdmin
-        .from('conversation_participants')
-        .select('conversation_id')
-        .eq('user_id', userId);
+      const existingSnap = await db
+        .collection('conversations')
+        .where('participant_ids', 'array-contains', userId)
+        .get();
 
-      const myConvIds = (myConvs ?? []).map((c) => c.conversation_id);
-      let existingConvId: string | null = null;
+      const existingDoc = existingSnap.docs.find((d) => {
+        const data = d.data();
+        const pids = (data.participant_ids as string[]) ?? [];
+        const hasRecipient = pids.includes(body.recipient_id);
+        return hasRecipient && (body.post_id ? data.post_id === body.post_id : true);
+      });
 
-      if (myConvIds.length > 0) {
-        const { data: shared } = await supabaseAdmin
-          .from('conversation_participants')
-          .select('conversation_id, conversation:conversations(id, post_id)')
-          .eq('user_id', body.recipient_id)
-          .in('conversation_id', myConvIds);
+      const now = new Date().toISOString();
+      let conversationId = existingDoc?.id ?? null;
 
-        const match = (shared ?? []).find((s) => {
-          const conv = s.conversation as unknown as { id: string; post_id: string | null } | null;
-          return conv && (body.post_id ? conv.post_id === body.post_id : true);
-        });
-        if (match) existingConvId = match.conversation_id;
-      }
-
-      let conversationId = existingConvId;
       if (!conversationId) {
-        const { data: created, error } = await supabaseAdmin
-          .from('conversations')
-          .insert({ post_id: body.post_id ?? null })
-          .select()
-          .single();
-
-        if (error || !created) {
-          throw new AppError(500, 'INTERNAL_ERROR', 'Failed to create conversation');
-        }
-        conversationId = created.id;
-
-        await supabaseAdmin.from('conversation_participants').insert([
-          { conversation_id: conversationId, user_id: userId, last_read_at: new Date().toISOString() },
-          { conversation_id: conversationId, user_id: body.recipient_id },
-        ]);
+        const convRef = db.collection('conversations').doc();
+        conversationId = convRef.id;
+        await convRef.set({
+          id: conversationId,
+          post_id: body.post_id ?? null,
+          participant_ids: [userId, body.recipient_id],
+          created_at: now,
+          updated_at: now,
+        });
       }
 
       if (body.initial_message) {
-        await supabaseAdmin.from('messages').insert({
+        await db.collection('conversations').doc(conversationId).collection('messages').add({
           conversation_id: conversationId,
           sender_id: userId,
           content: sanitizeText(body.initial_message),
+          is_read: false,
+          created_at: now,
         });
 
-        await supabaseAdmin
-          .from('conversations')
-          .update({ updated_at: new Date().toISOString() })
-          .eq('id', conversationId);
+        await db.collection('conversations').doc(conversationId).update({ updated_at: now });
 
         await createNotification({
           userId: body.recipient_id,
@@ -183,7 +177,7 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
         });
       }
 
-      return reply.status(existingConvId ? 200 : 201).send({ conversation_id: conversationId });
+      return reply.status(existingDoc ? 200 : 201).send({ conversation_id: conversationId });
     }
   );
 
@@ -201,25 +195,27 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
       const userId = request.authUser!.id;
       await assertParticipant(id, userId);
 
-      const { data: messages, error } = await supabaseAdmin
-        .from('messages')
-        .select('id, conversation_id, sender_id, content, is_read, created_at')
-        .eq('conversation_id', id)
-        .order('created_at', { ascending: true });
+      const db = getDb();
+      const snap = await db
+        .collection('conversations')
+        .doc(id)
+        .collection('messages')
+        .orderBy('created_at', 'asc')
+        .get();
 
-      if (error) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to load messages');
-      }
+      const batch = db.batch();
+      let hasUnread = false;
+      const messages = snap.docs.map((d) => {
+        const m = d.data();
+        if (m.sender_id !== userId && m.is_read === false) {
+          batch.update(d.ref, { is_read: true });
+          hasUnread = true;
+        }
+        return { id: d.id, ...m };
+      });
 
-      // Mark incoming messages as read
-      await supabaseAdmin
-        .from('messages')
-        .update({ is_read: true })
-        .eq('conversation_id', id)
-        .neq('sender_id', userId)
-        .eq('is_read', false);
-
-      return { messages: messages ?? [] };
+      if (hasUnread) await batch.commit();
+      return { messages };
     }
   );
 
@@ -235,39 +231,29 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
     async (request, reply) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
-      await assertParticipant(id, userId);
+      const conv = await assertParticipant(id, userId);
 
       const body = sendMessageSchema.parse(request.body);
       assertNoSensitiveFinancialData(body.content);
 
-      const { data: message, error } = await supabaseAdmin
-        .from('messages')
-        .insert({
-          conversation_id: id,
-          sender_id: userId,
-          content: sanitizeText(body.content),
-        })
-        .select()
-        .single();
+      const db = getDb();
+      const now = new Date().toISOString();
+      const msgRef = db.collection('conversations').doc(id).collection('messages').doc();
+      const message = {
+        id: msgRef.id,
+        conversation_id: id,
+        sender_id: userId,
+        content: sanitizeText(body.content),
+        is_read: false,
+        created_at: now,
+      };
+      await msgRef.set(message);
+      await db.collection('conversations').doc(id).update({ updated_at: now });
 
-      if (error || !message) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to send message');
-      }
-
-      await supabaseAdmin
-        .from('conversations')
-        .update({ updated_at: new Date().toISOString() })
-        .eq('id', id);
-
-      const { data: others } = await supabaseAdmin
-        .from('conversation_participants')
-        .select('user_id')
-        .eq('conversation_id', id)
-        .neq('user_id', userId);
-
-      for (const p of others ?? []) {
+      const others = ((conv.participant_ids as string[]) ?? []).filter((pid) => pid !== userId);
+      for (const otherId of others) {
         await createNotification({
-          userId: p.user_id,
+          userId: otherId,
           type: 'new_message',
           title: 'New message',
           body: `${request.authUser!.full_name} sent you a message.`,
@@ -293,19 +279,23 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
       const userId = request.authUser!.id;
       await assertParticipant(id, userId);
 
-      await Promise.all([
-        supabaseAdmin
-          .from('messages')
-          .update({ is_read: true })
-          .eq('conversation_id', id)
-          .neq('sender_id', userId)
-          .eq('is_read', false),
-        supabaseAdmin
-          .from('conversation_participants')
-          .update({ last_read_at: new Date().toISOString() })
-          .eq('conversation_id', id)
-          .eq('user_id', userId),
-      ]);
+      const db = getDb();
+      const snap = await db
+        .collection('conversations')
+        .doc(id)
+        .collection('messages')
+        .where('is_read', '==', false)
+        .get();
+
+      const batch = db.batch();
+      let updated = false;
+      for (const d of snap.docs) {
+        if (d.data().sender_id !== userId) {
+          batch.update(d.ref, { is_read: true });
+          updated = true;
+        }
+      }
+      if (updated) await batch.commit();
 
       return { success: true };
     }

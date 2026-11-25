@@ -1,13 +1,12 @@
 import type { FastifyInstance } from 'fastify';
 import { AppError } from '../../lib/errors.js';
+import { getDb } from '../../lib/firebase.js';
 import { assertNoSensitiveFinancialData, sanitizeText } from '../../lib/security.js';
-import { supabaseAdmin } from '../../lib/supabase.js';
 import { authenticate } from '../../middleware/auth.js';
 import { createClaimSchema } from '../../schemas/interactions.schema.js';
 import { createNotification } from '../../services/notifications.service.js';
 
 export async function claimRoutes(app: FastifyInstance): Promise<void> {
-  // Offer to donate (on help_request) or Request an item (on donation_offer)
   app.post<{ Params: { postId: string } }>(
     '/posts/:postId/claims',
     {
@@ -24,13 +23,11 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
 
       assertNoSensitiveFinancialData(body.message);
 
-      const { data: post } = await supabaseAdmin
-        .from('posts')
-        .select('id, author_id, post_type, donation_type, status, title')
-        .eq('id', postId)
-        .single();
+      const db = getDb();
+      const postSnap = await db.collection('posts').doc(postId).get();
+      if (!postSnap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
 
-      if (!post) throw new AppError(404, 'NOT_FOUND', 'Post not found');
+      const post = postSnap.data()!;
       if (post.author_id === userId) {
         throw new AppError(400, 'BAD_REQUEST', 'You cannot claim or offer on your own post');
       }
@@ -38,41 +35,50 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, 'BAD_REQUEST', 'This post is no longer accepting offers or requests');
       }
 
-      const claimType = post.post_type === 'help_request' ? 'offer_to_donate' : 'request_item';
+      const duplicateSnap = await db
+        .collection('claims')
+        .where('post_id', '==', postId)
+        .where('claimant_id', '==', userId)
+        .where('status', 'in', ['pending', 'accepted'])
+        .limit(1)
+        .get();
 
-      const { data: claim, error } = await supabaseAdmin
-        .from('claims')
-        .insert({
-          post_id: postId,
-          claimant_id: userId,
-          claim_type: claimType,
-          message: body.message ? sanitizeText(body.message) : null,
-          quantity_offered: body.quantity_offered ?? null,
-          status: 'pending',
-        })
-        .select()
-        .single();
-
-      if (error) {
-        if (error.code === '23505') {
-          throw new AppError(409, 'CONFLICT', 'You already have an active offer or request on this post');
-        }
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to create claim');
+      if (!duplicateSnap.empty) {
+        throw new AppError(409, 'CONFLICT', 'You already have an active offer or request on this post');
       }
 
+      const claimType = post.post_type === 'help_request' ? 'offer_to_donate' : 'request_item';
+      const now = new Date().toISOString();
+      const claimRef = db.collection('claims').doc();
+      const claimDoc = {
+        id: claimRef.id,
+        post_id: postId,
+        post_author_id: post.author_id,
+        claimant_id: userId,
+        claim_type: claimType,
+        message: body.message ? sanitizeText(body.message) : null,
+        quantity_offered: body.quantity_offered ?? null,
+        status: 'pending',
+        donor_confirmed_handover: false,
+        recipient_confirmed_handover: false,
+        confirmed_at: null,
+        created_at: now,
+        updated_at: now,
+      };
+      await claimRef.set(claimDoc);
+
       await createNotification({
-        userId: post.author_id,
+        userId: String(post.author_id),
         type: claimType === 'offer_to_donate' ? 'new_offer' : 'new_request',
         title: claimType === 'offer_to_donate' ? 'New donation offer received' : 'New item request received',
         body: `${request.authUser!.full_name} responded to "${post.title}".`,
         link: `/posts/${postId}`,
       });
 
-      return reply.status(201).send({ claim });
+      return reply.status(201).send({ claim: claimDoc });
     }
   );
 
-  // List my claims & received offers
   app.get(
     '/claims/mine',
     {
@@ -84,45 +90,41 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
+      const db = getDb();
 
-      const [{ data: outgoing }, { data: myPosts }] = await Promise.all([
-        supabaseAdmin
-          .from('claims')
-          .select(
-            `
-            *,
-            post:posts(id, title, post_type, donation_type, status, location_city, author_id,
-              author:profiles!posts_author_id_fkey(id, full_name))
-          `
-          )
-          .eq('claimant_id', userId)
-          .order('created_at', { ascending: false }),
-        supabaseAdmin.from('posts').select('id').eq('author_id', userId),
+      const [outgoingSnap, incomingSnap] = await Promise.all([
+        db.collection('claims').where('claimant_id', '==', userId).orderBy('created_at', 'desc').get(),
+        db.collection('claims').where('post_author_id', '==', userId).orderBy('created_at', 'desc').get(),
       ]);
 
-      const postIds = (myPosts ?? []).map((p) => p.id);
-      let incoming: unknown[] = [];
+      const hydrate = async (docs: FirebaseFirestore.QueryDocumentSnapshot[]) =>
+        Promise.all(
+          docs.map(async (d) => {
+            const c = d.data();
+            const [postSnap, claimantSnap] = await Promise.all([
+              db.collection('posts').doc(String(c.post_id)).get(),
+              db.collection('profiles').doc(String(c.claimant_id)).get(),
+            ]);
+            return {
+              id: d.id,
+              ...c,
+              post: postSnap.exists ? { id: postSnap.id, ...postSnap.data() } : null,
+              claimant: claimantSnap.exists
+                ? { id: claimantSnap.id, full_name: claimantSnap.data()?.full_name }
+                : null,
+            };
+          })
+        );
 
-      if (postIds.length > 0) {
-        const { data: inc } = await supabaseAdmin
-          .from('claims')
-          .select(
-            `
-            *,
-            claimant:profiles!claims_claimant_id_fkey(id, full_name, location_city),
-            post:posts(id, title, post_type, donation_type, status)
-          `
-          )
-          .in('post_id', postIds)
-          .order('created_at', { ascending: false });
-        incoming = inc ?? [];
-      }
+      const [outgoing, incoming] = await Promise.all([
+        hydrate(outgoingSnap.docs),
+        hydrate(incomingSnap.docs),
+      ]);
 
-      return { outgoing: outgoing ?? [], incoming };
+      return { outgoing, incoming };
     }
   );
 
-  // Accept claim (transactional RPC with row locking)
   app.patch<{ Params: { id: string } }>(
     '/claims/:id/accept',
     {
@@ -135,34 +137,46 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
+      const db = getDb();
 
-      const { data: claim, error } = await supabaseAdmin.rpc('accept_claim_tx', {
-        p_claim_id: id,
-        p_owner_id: userId,
+      const updatedClaim = await db.runTransaction(async (tx) => {
+        const claimRef = db.collection('claims').doc(id);
+        const claimSnap = await tx.get(claimRef);
+        if (!claimSnap.exists) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
+
+        const claim = claimSnap.data()!;
+        const postRef = db.collection('posts').doc(String(claim.post_id));
+        const postSnap = await tx.get(postRef);
+        if (!postSnap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
+
+        const post = postSnap.data()!;
+        if (post.author_id !== userId) {
+          throw new AppError(403, 'FORBIDDEN', 'Only the post owner can accept');
+        }
+        if (post.status !== 'active') {
+          throw new AppError(400, 'BAD_REQUEST', 'Post is not active');
+        }
+        if (claim.status !== 'pending') {
+          throw new AppError(409, 'CONFLICT', 'Claim is no longer pending');
+        }
+
+        const now = new Date().toISOString();
+        tx.update(claimRef, { status: 'accepted', updated_at: now });
+        return { id: claimSnap.id, ...claim, status: 'accepted', updated_at: now } as Record<string, unknown>;
       });
 
-      if (error) {
-        const msg = error.message || '';
-        if (msg.includes('CLAIM_NOT_FOUND')) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
-        if (msg.includes('FORBIDDEN')) throw new AppError(403, 'FORBIDDEN', 'Only the post owner can accept');
-        if (msg.includes('POST_NOT_ACTIVE')) throw new AppError(400, 'BAD_REQUEST', 'Post is not active');
-        if (msg.includes('CLAIM_NOT_PENDING')) throw new AppError(409, 'CONFLICT', 'Claim is no longer pending');
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to accept claim');
-      }
-
       await createNotification({
-        userId: claim.claimant_id,
+        userId: String(updatedClaim.claimant_id),
         type: 'offer_accepted',
         title: 'Your offer/request was accepted!',
         body: 'You can now view handover details and coordinate directly.',
-        link: `/posts/${claim.post_id}`,
+        link: `/posts/${updatedClaim.post_id}`,
       });
 
-      return { claim };
+      return { claim: updatedClaim };
     }
   );
 
-  // Reject claim
   app.patch<{ Params: { id: string } }>(
     '/claims/:id/reject',
     {
@@ -175,40 +189,34 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
+      const db = getDb();
+      const claimRef = db.collection('claims').doc(id);
+      const claimSnap = await claimRef.get();
 
-      const { data: claim } = await supabaseAdmin
-        .from('claims')
-        .select('*, post:posts(author_id, title)')
-        .eq('id', id)
-        .single();
+      if (!claimSnap.exists) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
+      const claim = claimSnap.data()!;
+      if (claim.post_author_id !== userId) {
+        throw new AppError(403, 'FORBIDDEN', 'Only the post owner can reject');
+      }
+      if (claim.status !== 'pending') {
+        throw new AppError(409, 'CONFLICT', 'Only pending claims can be rejected');
+      }
 
-      if (!claim) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
-      const post = claim.post as { author_id: string; title: string };
-      if (post.author_id !== userId) throw new AppError(403, 'FORBIDDEN', 'Only the post owner can reject');
-      if (claim.status !== 'pending') throw new AppError(409, 'CONFLICT', 'Only pending claims can be rejected');
-
-      const { data: updated, error } = await supabaseAdmin
-        .from('claims')
-        .update({ status: 'rejected' })
-        .eq('id', id)
-        .select()
-        .single();
-
-      if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Failed to reject claim');
+      const now = new Date().toISOString();
+      await claimRef.update({ status: 'rejected', updated_at: now });
 
       await createNotification({
-        userId: claim.claimant_id,
+        userId: String(claim.claimant_id),
         type: 'offer_rejected',
         title: 'Offer/request update',
-        body: `Your response on "${post.title}" was declined.`,
+        body: 'Your response on a post was declined.',
         link: `/posts/${claim.post_id}`,
       });
 
-      return { claim: updated };
+      return { claim: { id, ...claim, status: 'rejected', updated_at: now } };
     }
   );
 
-  // Cancel own claim
   app.patch<{ Params: { id: string } }>(
     '/claims/:id/cancel',
     {
@@ -221,27 +229,25 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
+      const db = getDb();
+      const claimRef = db.collection('claims').doc(id);
+      const claimSnap = await claimRef.get();
 
-      const { data: claim } = await supabaseAdmin.from('claims').select('*').eq('id', id).single();
-      if (!claim) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
-      if (claim.claimant_id !== userId) throw new AppError(403, 'FORBIDDEN', 'Only the claimant can cancel');
-      if (!['pending', 'accepted'].includes(claim.status)) {
+      if (!claimSnap.exists) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
+      const claim = claimSnap.data()!;
+      if (claim.claimant_id !== userId) {
+        throw new AppError(403, 'FORBIDDEN', 'Only the claimant can cancel');
+      }
+      if (!['pending', 'accepted'].includes(String(claim.status))) {
         throw new AppError(409, 'CONFLICT', 'This claim cannot be cancelled');
       }
 
-      const { data: updated, error } = await supabaseAdmin
-        .from('claims')
-        .update({ status: 'cancelled' })
-        .eq('id', id)
-        .select()
-        .single();
-
-      if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Failed to cancel claim');
-      return { claim: updated };
+      const now = new Date().toISOString();
+      await claimRef.update({ status: 'cancelled', updated_at: now });
+      return { claim: { id, ...claim, status: 'cancelled', updated_at: now } };
     }
   );
 
-  // Confirm direct handover (requires both donor and recipient to confirm completion)
   app.patch<{ Params: { id: string } }>(
     '/claims/:id/confirm-handover',
     {
@@ -254,19 +260,18 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
+      const db = getDb();
+      const claimRef = db.collection('claims').doc(id);
+      const claimSnap = await claimRef.get();
 
-      const { data: claim } = await supabaseAdmin
-        .from('claims')
-        .select('*, post:posts(id, author_id, post_type, title)')
-        .eq('id', id)
-        .single();
-
-      if (!claim) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
+      if (!claimSnap.exists) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
+      const claim = claimSnap.data()!;
       if (claim.status !== 'accepted') {
         throw new AppError(409, 'CONFLICT', 'Handover can only be confirmed for accepted claims');
       }
 
-      const post = claim.post as { id: string; author_id: string; post_type: string; title: string };
+      const postSnap = await db.collection('posts').doc(String(claim.post_id)).get();
+      const post = postSnap.data()!;
       const isOwner = post.author_id === userId;
       const isClaimant = claim.claimant_id === userId;
 
@@ -278,25 +283,21 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
         (post.post_type === 'donation_offer' && isOwner) ||
         (post.post_type === 'help_request' && isClaimant);
 
-      const nextDonorConfirmed = isUserDonor ? true : claim.donor_confirmed_handover;
-      const nextRecipientConfirmed = !isUserDonor ? true : claim.recipient_confirmed_handover;
+      const nextDonorConfirmed = isUserDonor ? true : Boolean(claim.donor_confirmed_handover);
+      const nextRecipientConfirmed = !isUserDonor ? true : Boolean(claim.recipient_confirmed_handover);
       const bothConfirmed = nextDonorConfirmed && nextRecipientConfirmed;
+      const now = new Date().toISOString();
 
-      const { data: updated, error } = await supabaseAdmin
-        .from('claims')
-        .update({
-          donor_confirmed_handover: nextDonorConfirmed,
-          recipient_confirmed_handover: nextRecipientConfirmed,
-          status: bothConfirmed ? 'completed' : 'accepted',
-          confirmed_at: bothConfirmed ? new Date().toISOString() : null,
-        })
-        .eq('id', id)
-        .select()
-        .single();
+      const updates = {
+        donor_confirmed_handover: nextDonorConfirmed,
+        recipient_confirmed_handover: nextRecipientConfirmed,
+        status: bothConfirmed ? 'completed' : 'accepted',
+        confirmed_at: bothConfirmed ? now : null,
+        updated_at: now,
+      };
+      await claimRef.update(updates);
 
-      if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Failed to confirm handover');
-
-      const otherUserId = isOwner ? claim.claimant_id : post.author_id;
+      const otherUserId = isOwner ? String(claim.claimant_id) : String(post.author_id);
       await createNotification({
         userId: otherUserId,
         type: 'contribution_confirmed',
@@ -304,10 +305,10 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
         body: bothConfirmed
           ? `Both parties confirmed the handover for "${post.title}".`
           : `The other party confirmed handover for "${post.title}". Please confirm when ready.`,
-        link: `/posts/${post.id}`,
+        link: `/posts/${claim.post_id}`,
       });
 
-      return { claim: updated };
+      return { claim: { id, ...claim, ...updates } };
     }
   );
 }

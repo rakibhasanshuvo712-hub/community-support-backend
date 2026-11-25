@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { AppError } from '../../lib/errors.js';
+import { getDb } from '../../lib/firebase.js';
 import { sanitizeText } from '../../lib/security.js';
-import { supabaseAdmin } from '../../lib/supabase.js';
 import { requireAdmin } from '../../middleware/auth.js';
 import {
   adminPostStatusSchema,
@@ -22,21 +22,22 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
+      const db = getDb();
       const [users, posts, claims, contributions, openReports] = await Promise.all([
-        supabaseAdmin.from('profiles').select('id', { count: 'exact', head: true }),
-        supabaseAdmin.from('posts').select('id', { count: 'exact', head: true }),
-        supabaseAdmin.from('claims').select('id', { count: 'exact', head: true }),
-        supabaseAdmin.from('contributions').select('id', { count: 'exact', head: true }),
-        supabaseAdmin.from('reports').select('id', { count: 'exact', head: true }).eq('status', 'open'),
+        db.collection('profiles').count().get(),
+        db.collection('posts').count().get(),
+        db.collection('claims').count().get(),
+        db.collection('contributions').count().get(),
+        db.collection('reports').where('status', '==', 'open').count().get(),
       ]);
 
       return {
         stats: {
-          total_users: users.count ?? 0,
-          total_posts: posts.count ?? 0,
-          total_claims: claims.count ?? 0,
-          total_contributions: contributions.count ?? 0,
-          open_reports: openReports.count ?? 0,
+          total_users: users.data().count,
+          total_posts: posts.data().count,
+          total_claims: claims.data().count,
+          total_contributions: contributions.data().count,
+          open_reports: openReports.data().count,
         },
       };
     }
@@ -51,14 +52,8 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
-      const { data, error } = await supabaseAdmin
-        .from('profiles')
-        .select('id, full_name, role, is_suspended, suspended_reason, location_city, created_at')
-        .order('created_at', { ascending: false })
-        .limit(100);
-
-      if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Failed to fetch users');
-      return { users: data ?? [] };
+      const snap = await getDb().collection('profiles').orderBy('created_at', 'desc').limit(100).get();
+      return { users: snap.docs.map((d) => ({ id: d.id, ...d.data() })) };
     }
   );
 
@@ -79,26 +74,28 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, 'BAD_REQUEST', 'You cannot suspend your own admin account');
       }
 
-      const { data: updated, error } = await supabaseAdmin
-        .from('profiles')
-        .update({
-          is_suspended: body.is_suspended,
-          suspended_reason: body.is_suspended ? sanitizeText(body.reason) : null,
-        })
-        .eq('id', id)
-        .select()
-        .single();
+      const db = getDb();
+      const ref = db.collection('profiles').doc(id);
+      const snap = await ref.get();
+      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'User not found');
 
-      if (error || !updated) throw new AppError(404, 'NOT_FOUND', 'User not found');
+      const now = new Date().toISOString();
+      const updates = {
+        is_suspended: body.is_suspended,
+        suspended_reason: body.is_suspended ? sanitizeText(body.reason) : null,
+        updated_at: now,
+      };
+      await ref.update(updates);
 
-      await supabaseAdmin.from('moderation_actions').insert({
+      await db.collection('moderation_actions').add({
         admin_id: adminId,
         action_type: body.is_suspended ? 'suspend_user' : 'unsuspend_user',
         target_user_id: id,
         reason: sanitizeText(body.reason),
+        created_at: now,
       });
 
-      return { user: updated };
+      return { user: { id, ...snap.data(), ...updates } };
     }
   );
 
@@ -111,19 +108,8 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
-      const { data, error } = await supabaseAdmin
-        .from('posts')
-        .select(
-          `
-          id, title, post_type, donation_type, status, urgency, location_city, created_at,
-          author:profiles!posts_author_id_fkey(id, full_name, is_suspended)
-        `
-        )
-        .order('created_at', { ascending: false })
-        .limit(100);
-
-      if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Failed to fetch posts');
-      return { posts: data ?? [] };
+      const snap = await getDb().collection('posts').orderBy('created_at', 'desc').limit(100).get();
+      return { posts: snap.docs.map((d) => ({ id: d.id, ...d.data() })) };
     }
   );
 
@@ -140,31 +126,32 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       const adminId = request.authUser!.id;
       const body = adminPostStatusSchema.parse(request.body);
 
-      const { data: updated, error } = await supabaseAdmin
-        .from('posts')
-        .update({ status: body.status })
-        .eq('id', id)
-        .select()
-        .single();
+      const db = getDb();
+      const ref = db.collection('posts').doc(id);
+      const snap = await ref.get();
+      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
 
-      if (error || !updated) throw new AppError(404, 'NOT_FOUND', 'Post not found');
+      const existing = snap.data()!;
+      const now = new Date().toISOString();
+      await ref.update({ status: body.status, updated_at: now });
 
-      await supabaseAdmin.from('moderation_actions').insert({
+      await db.collection('moderation_actions').add({
         admin_id: adminId,
         action_type: body.status === 'removed' ? 'remove_post' : 'restore_post',
         target_post_id: id,
         reason: sanitizeText(body.reason),
+        created_at: now,
       });
 
       await createNotification({
-        userId: updated.author_id,
+        userId: String(existing.author_id),
         type: 'moderation',
         title: 'Post moderation update',
-        body: `Your post "${updated.title}" status was updated to ${body.status}: ${sanitizeText(body.reason)}`,
+        body: `Your post "${existing.title}" status was updated to ${body.status}: ${sanitizeText(body.reason)}`,
         link: `/posts/${id}`,
       });
 
-      return { post: updated };
+      return { post: { id, ...existing, status: body.status, updated_at: now } };
     }
   );
 
@@ -177,19 +164,8 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
-      const { data, error } = await supabaseAdmin
-        .from('reports')
-        .select(
-          `
-          *,
-          reporter:profiles!reports_reporter_id_fkey(id, full_name)
-        `
-        )
-        .order('created_at', { ascending: false })
-        .limit(100);
-
-      if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Failed to fetch reports');
-      return { reports: data ?? [] };
+      const snap = await getDb().collection('reports').orderBy('created_at', 'desc').limit(100).get();
+      return { reports: snap.docs.map((d) => ({ id: d.id, ...d.data() })) };
     }
   );
 
@@ -206,29 +182,30 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       const adminId = request.authUser!.id;
       const body = adminResolveReportSchema.parse(request.body);
 
-      const { data: updated, error } = await supabaseAdmin
-        .from('reports')
-        .update({
-          status: body.status,
-          resolved_by: adminId,
-          resolved_at: body.status === 'reviewing' ? null : new Date().toISOString(),
-        })
-        .eq('id', id)
-        .select()
-        .single();
+      const db = getDb();
+      const ref = db.collection('reports').doc(id);
+      const snap = await ref.get();
+      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'Report not found');
 
-      if (error || !updated) throw new AppError(404, 'NOT_FOUND', 'Report not found');
+      const now = new Date().toISOString();
+      const updates = {
+        status: body.status,
+        resolved_by: adminId,
+        resolved_at: body.status === 'reviewing' ? null : now,
+      };
+      await ref.update(updates);
 
       if (body.status === 'resolved' || body.status === 'dismissed') {
-        await supabaseAdmin.from('moderation_actions').insert({
+        await db.collection('moderation_actions').add({
           admin_id: adminId,
           action_type: body.status === 'resolved' ? 'resolve_report' : 'dismiss_report',
           report_id: id,
           reason: sanitizeText(body.reason),
+          created_at: now,
         });
       }
 
-      return { report: updated };
+      return { report: { id, ...snap.data(), ...updates } };
     }
   );
 }

@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
-import { AppError } from '../../lib/errors.js';
-import { supabaseAdmin } from '../../lib/supabase.js';
+import { isFirebaseConfigured } from '../../config/env.js';
+import { getDb } from '../../lib/firebase.js';
+import { DEFAULT_CATEGORIES, ensureCategoriesSeeded } from '../../services/seed.service.js';
 
 export async function categoryRoutes(app: FastifyInstance): Promise<void> {
   app.get(
@@ -12,16 +13,14 @@ export async function categoryRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
-      const { data, error } = await supabaseAdmin
-        .from('categories')
-        .select('id, slug, name_en, name_bn, icon, is_restricted, restriction_note_en, restriction_note_bn, sort_order')
-        .order('sort_order', { ascending: true });
-
-      if (error) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to fetch categories');
+      if (!isFirebaseConfigured()) {
+        return { categories: DEFAULT_CATEGORIES };
       }
 
-      return { categories: data ?? [] };
+      await ensureCategoriesSeeded();
+      const snap = await getDb().collection('categories').orderBy('sort_order', 'asc').get();
+      const categories = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      return { categories };
     }
   );
 }

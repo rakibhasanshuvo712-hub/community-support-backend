@@ -1,9 +1,30 @@
 import type { FastifyInstance } from 'fastify';
+import { env, isFirebaseConfigured } from '../../config/env.js';
 import { AppError } from '../../lib/errors.js';
+import { getAdminAuth, getDb, getSignedReadUrl } from '../../lib/firebase.js';
 import { sanitizeText } from '../../lib/security.js';
-import { supabaseAdmin, supabaseAnon, createSupabaseUserClient } from '../../lib/supabase.js';
 import { authenticate } from '../../middleware/auth.js';
 import { loginSchema, registerSchema, resetPasswordSchema } from '../../schemas/auth.schema.js';
+
+async function firebaseIdentityToolkit(endpoint: string, payload: Record<string, unknown>) {
+  if (!env.FIREBASE_WEB_API_KEY) {
+    throw new AppError(503, 'SERVICE_UNAVAILABLE', 'FIREBASE_WEB_API_KEY is not configured');
+  }
+  const res = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/accounts:${endpoint}?key=${env.FIREBASE_WEB_API_KEY}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }
+  );
+  const data = (await res.json()) as Record<string, unknown>;
+  if (!res.ok) {
+    const errMsg = (data.error as { message?: string } | undefined)?.message || 'Authentication failed';
+    throw new AppError(400, 'BAD_REQUEST', errMsg);
+  }
+  return data;
+}
 
 export async function authRoutes(app: FastifyInstance): Promise<void> {
   app.post(
@@ -11,44 +32,69 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     {
       schema: {
         tags: ['Auth'],
-        summary: 'Register a new user account',
+        summary: 'Register a new user account with Firebase Auth',
       },
     },
     async (request, reply) => {
       const body = registerSchema.parse(request.body);
+      if (!isFirebaseConfigured()) {
+        throw new AppError(503, 'SERVICE_UNAVAILABLE', 'Firebase is not configured yet');
+      }
+      const email = body.email.toLowerCase();
+      const fullName = sanitizeText(body.full_name);
 
-      const { data, error } = await supabaseAnon.auth.signUp({
-        email: body.email.toLowerCase(),
+      const result = await firebaseIdentityToolkit('signUp', {
+        email,
         password: body.password,
-        options: {
-          data: {
-            full_name: sanitizeText(body.full_name),
-            preferred_language: body.preferred_language,
-          },
-        },
+        returnSecureToken: true,
       });
 
-      if (error) {
-        throw new AppError(400, 'BAD_REQUEST', error.message);
-      }
+      const uid = String(result.localId);
+      const idToken = String(result.idToken);
+      const refreshToken = String(result.refreshToken);
+      const now = new Date().toISOString();
 
-      if (data.user) {
-        await supabaseAdmin
-          .from('profiles')
-          .update({ preferred_language: body.preferred_language })
-          .eq('id', data.user.id);
-      }
+      await getAdminAuth().updateUser(uid, { displayName: fullName });
+
+      const db = getDb();
+      await Promise.all([
+        db.collection('profiles').doc(uid).set({
+          id: uid,
+          full_name: fullName,
+          avatar_url: null,
+          bio: null,
+          role: 'user',
+          is_suspended: false,
+          suspended_reason: null,
+          preferred_language: body.preferred_language,
+          location_city: null,
+          location_area: null,
+          created_at: now,
+          updated_at: now,
+        }),
+        db.collection('profile_contacts').doc(uid).set({
+          user_id: uid,
+          email,
+          phone: null,
+          exact_address: null,
+          updated_at: now,
+        }),
+      ]);
 
       return reply.status(201).send({
-        user: data.user ? { id: data.user.id, email: data.user.email } : null,
-        session: data.session
-          ? {
-              access_token: data.session.access_token,
-              refresh_token: data.session.refresh_token,
-              expires_at: data.session.expires_at,
-            }
-          : null,
-        requires_email_verification: !data.session,
+        user: {
+          id: uid,
+          email,
+          full_name: fullName,
+          role: 'user',
+          preferred_language: body.preferred_language,
+        },
+        session: {
+          access_token: idToken,
+          refresh_token: refreshToken,
+          expires_at: Number(result.expiresIn || 3600),
+        },
+        requires_email_verification: false,
       });
     }
   );
@@ -58,26 +104,24 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     {
       schema: {
         tags: ['Auth'],
-        summary: 'Sign in with email and password',
+        summary: 'Sign in with email and password via Firebase Auth',
       },
     },
     async (request) => {
       const body = loginSchema.parse(request.body);
-
-      const { data, error } = await supabaseAnon.auth.signInWithPassword({
+      if (!isFirebaseConfigured()) {
+        throw new AppError(503, 'SERVICE_UNAVAILABLE', 'Firebase is not configured yet');
+      }
+      const result = await firebaseIdentityToolkit('signInWithPassword', {
         email: body.email.toLowerCase(),
         password: body.password,
+        returnSecureToken: true,
       });
 
-      if (error || !data.session || !data.user) {
-        throw new AppError(401, 'UNAUTHORIZED', error?.message || 'Invalid email or password');
-      }
-
-      const { data: profile } = await supabaseAdmin
-        .from('profiles')
-        .select('id, full_name, role, is_suspended, preferred_language, avatar_url')
-        .eq('id', data.user.id)
-        .single();
+      const uid = String(result.localId);
+      const db = getDb();
+      const profileSnap = await db.collection('profiles').doc(uid).get();
+      const profile = profileSnap.data();
 
       if (profile?.is_suspended) {
         throw new AppError(403, 'FORBIDDEN', 'Your account has been suspended');
@@ -85,14 +129,14 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
       return {
         user: {
-          id: data.user.id,
-          email: data.user.email,
+          id: uid,
+          email: String(result.email || body.email.toLowerCase()),
           ...profile,
         },
         session: {
-          access_token: data.session.access_token,
-          refresh_token: data.session.refresh_token,
-          expires_at: data.session.expires_at,
+          access_token: String(result.idToken),
+          refresh_token: String(result.refreshToken),
+          expires_at: Number(result.expiresIn || 3600),
         },
       };
     }
@@ -104,14 +148,11 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       preHandler: [authenticate],
       schema: {
         tags: ['Auth'],
-        summary: 'Sign out current session',
+        summary: 'Revoke refresh tokens for current user',
       },
     },
     async (request) => {
-      if (request.accessToken) {
-        const userClient = createSupabaseUserClient(request.accessToken);
-        await userClient.auth.signOut();
-      }
+      await getAdminAuth().revokeRefreshTokens(request.authUser!.id);
       return { success: true };
     }
   );
@@ -121,18 +162,18 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     {
       schema: {
         tags: ['Auth'],
-        summary: 'Request password reset email',
+        summary: 'Send Firebase password reset email',
       },
     },
     async (request) => {
       const body = resetPasswordSchema.parse(request.body);
-      const { error } = await supabaseAnon.auth.resetPasswordForEmail(body.email.toLowerCase(), {
-        redirectTo: body.redirect_to,
-      });
-
-      if (error) {
-        throw new AppError(400, 'BAD_REQUEST', error.message);
+      if (!isFirebaseConfigured()) {
+        throw new AppError(503, 'SERVICE_UNAVAILABLE', 'Firebase is not configured yet');
       }
+      await firebaseIdentityToolkit('sendOobCode', {
+        requestType: 'PASSWORD_RESET',
+        email: body.email.toLowerCase(),
+      });
 
       return {
         success: true,
@@ -152,32 +193,33 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const [{ data: profile }, { data: contacts }] = await Promise.all([
-        supabaseAdmin
-          .from('profiles')
-          .select('id, full_name, avatar_url, bio, role, is_suspended, preferred_language, location_city, location_area, created_at')
-          .eq('id', userId)
-          .single(),
-        supabaseAdmin
-          .from('profile_contacts')
-          .select('email, phone, exact_address')
-          .eq('user_id', userId)
-          .single(),
+      const db = getDb();
+      const [profileSnap, contactSnap] = await Promise.all([
+        db.collection('profiles').doc(userId).get(),
+        db.collection('profile_contacts').doc(userId).get(),
       ]);
 
-      let avatarSignedUrl: string | null = null;
-      if (profile?.avatar_url) {
-        const { data: signed } = await supabaseAdmin.storage
-          .from('avatars')
-          .createSignedUrl(profile.avatar_url, 3600);
-        avatarSignedUrl = signed?.signedUrl ?? null;
-      }
+      const profile = profileSnap.data() ?? {};
+      const contacts = contactSnap.data() ?? {
+        email: request.authUser!.email,
+        phone: null,
+        exact_address: null,
+      };
+
+      const avatarSignedUrl = profile.avatar_url
+        ? await getSignedReadUrl(String(profile.avatar_url))
+        : null;
 
       return {
         user: {
           ...profile,
+          id: userId,
           avatar_signed_url: avatarSignedUrl,
-          contacts: contacts ?? { email: request.authUser!.email, phone: null, exact_address: null },
+          contacts: {
+            email: contacts.email ?? request.authUser!.email,
+            phone: contacts.phone ?? null,
+            exact_address: contacts.exact_address ?? null,
+          },
         },
       };
     }

@@ -1,15 +1,14 @@
 import type { FastifyInstance } from 'fastify';
 import { AppError } from '../../lib/errors.js';
+import { getDb, getSignedReadUrl, uploadBufferToStorage } from '../../lib/firebase.js';
 import { assertNoSensitiveFinancialData, sanitizeText } from '../../lib/security.js';
-import { supabaseAdmin } from '../../lib/supabase.js';
 import { authenticate } from '../../middleware/auth.js';
 import { updateProfileSchema } from '../../schemas/auth.schema.js';
 
 const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
-const MAX_AVATAR_BYTES = 2 * 1024 * 1024; // 2MB
+const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 
 export async function profileRoutes(app: FastifyInstance): Promise<void> {
-  // Public safe profile (never exposes email, phone, or exact_address)
   app.get<{ Params: { id: string } }>(
     '/:id',
     {
@@ -20,36 +19,33 @@ export async function profileRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const { id } = request.params;
-      const { data: profile, error } = await supabaseAdmin
-        .from('profiles')
-        .select('id, full_name, avatar_url, bio, location_city, location_area, created_at')
-        .eq('id', id)
-        .eq('is_suspended', false)
-        .single();
+      const db = getDb();
+      const snap = await db.collection('profiles').doc(id).get();
 
-      if (error || !profile) {
+      if (!snap.exists || snap.data()?.is_suspended) {
         throw new AppError(404, 'NOT_FOUND', 'Profile not found');
       }
 
-      let avatarSignedUrl: string | null = null;
-      if (profile.avatar_url) {
-        const { data: signed } = await supabaseAdmin.storage
-          .from('avatars')
-          .createSignedUrl(profile.avatar_url, 3600);
-        avatarSignedUrl = signed?.signedUrl ?? null;
-      }
+      const p = snap.data()!;
+      const avatarSignedUrl = p.avatar_url ? await getSignedReadUrl(String(p.avatar_url)) : null;
 
-      const { count: postsCount } = await supabaseAdmin
-        .from('posts')
-        .select('id', { count: 'exact', head: true })
-        .eq('author_id', id)
-        .in('status', ['active', 'fulfilled']);
+      const postsSnap = await db
+        .collection('posts')
+        .where('author_id', '==', id)
+        .where('status', 'in', ['active', 'fulfilled'])
+        .get();
 
       return {
         profile: {
-          ...profile,
+          id: snap.id,
+          full_name: p.full_name,
+          avatar_url: p.avatar_url ?? null,
           avatar_signed_url: avatarSignedUrl,
-          public_posts_count: postsCount ?? 0,
+          bio: p.bio ?? null,
+          location_city: p.location_city ?? null,
+          location_area: p.location_area ?? null,
+          created_at: p.created_at,
+          public_posts_count: postsSnap.size,
         },
       };
     }
@@ -70,33 +66,23 @@ export async function profileRoutes(app: FastifyInstance): Promise<void> {
 
       assertNoSensitiveFinancialData(body.bio, body.exact_address);
 
-      const profileUpdate: Record<string, unknown> = {};
+      const db = getDb();
+      const now = new Date().toISOString();
+      const profileUpdate: Record<string, unknown> = { updated_at: now };
+
       if (body.full_name !== undefined) profileUpdate.full_name = sanitizeText(body.full_name);
       if (body.bio !== undefined) profileUpdate.bio = body.bio ? sanitizeText(body.bio) : null;
       if (body.preferred_language !== undefined) profileUpdate.preferred_language = body.preferred_language;
       if (body.location_city !== undefined) profileUpdate.location_city = body.location_city ? sanitizeText(body.location_city) : null;
       if (body.location_area !== undefined) profileUpdate.location_area = body.location_area ? sanitizeText(body.location_area) : null;
 
-      if (Object.keys(profileUpdate).length > 0) {
-        const { error } = await supabaseAdmin.from('profiles').update(profileUpdate).eq('id', userId);
-        if (error) {
-          throw new AppError(500, 'INTERNAL_ERROR', 'Failed to update profile');
-        }
-      }
+      await db.collection('profiles').doc(userId).set(profileUpdate, { merge: true });
 
-      const contactUpdate: Record<string, unknown> = {};
+      const contactUpdate: Record<string, unknown> = { user_id: userId, updated_at: now };
       if (body.phone !== undefined) contactUpdate.phone = body.phone ? sanitizeText(body.phone) : null;
       if (body.exact_address !== undefined) contactUpdate.exact_address = body.exact_address ? sanitizeText(body.exact_address) : null;
 
-      if (Object.keys(contactUpdate).length > 0) {
-        const { error } = await supabaseAdmin
-          .from('profile_contacts')
-          .upsert({ user_id: userId, ...contactUpdate }, { onConflict: 'user_id' });
-        if (error) {
-          throw new AppError(500, 'INTERNAL_ERROR', 'Failed to update contact details');
-        }
-      }
-
+      await db.collection('profile_contacts').doc(userId).set(contactUpdate, { merge: true });
       return { success: true };
     }
   );
@@ -107,15 +93,13 @@ export async function profileRoutes(app: FastifyInstance): Promise<void> {
       preHandler: [authenticate],
       schema: {
         tags: ['Profiles'],
-        summary: 'Upload profile avatar photo to private storage',
+        summary: 'Upload profile avatar photo to Firebase Storage',
       },
     },
     async (request) => {
       const userId = request.authUser!.id;
       const file = await request.file();
-      if (!file) {
-        throw new AppError(400, 'BAD_REQUEST', 'No file uploaded');
-      }
+      if (!file) throw new AppError(400, 'BAD_REQUEST', 'No file uploaded');
       if (!ALLOWED_IMAGE_TYPES.has(file.mimetype)) {
         throw new AppError(400, 'VALIDATION_ERROR', 'Only JPEG, PNG, and WebP images are allowed');
       }
@@ -126,28 +110,18 @@ export async function profileRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const ext = file.mimetype === 'image/png' ? 'png' : file.mimetype === 'image/webp' ? 'webp' : 'jpg';
-      const storagePath = `${userId}/avatar.${ext}`;
+      const storagePath = `avatars/${userId}/avatar.${ext}`;
 
-      const { error: uploadError } = await supabaseAdmin.storage
-        .from('avatars')
-        .upload(storagePath, buffer, {
-          contentType: file.mimetype,
-          upsert: true,
-        });
+      await uploadBufferToStorage(storagePath, buffer, file.mimetype);
+      await getDb().collection('profiles').doc(userId).update({
+        avatar_url: storagePath,
+        updated_at: new Date().toISOString(),
+      });
 
-      if (uploadError) {
-        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to upload avatar');
-      }
-
-      await supabaseAdmin.from('profiles').update({ avatar_url: storagePath }).eq('id', userId);
-
-      const { data: signed } = await supabaseAdmin.storage
-        .from('avatars')
-        .createSignedUrl(storagePath, 3600);
-
+      const signedUrl = await getSignedReadUrl(storagePath);
       return {
         avatar_url: storagePath,
-        avatar_signed_url: signed?.signedUrl ?? null,
+        avatar_signed_url: signedUrl,
       };
     }
   );
