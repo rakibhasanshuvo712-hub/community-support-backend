@@ -14,7 +14,7 @@
     "community-support-api": {
       "root": ".",
       "buildCommand": "npm ci && npm run build",
-      "entrypoint": "dist/vercel.js"
+      "entrypoint": "dist/app.js"
     }
   }
 }

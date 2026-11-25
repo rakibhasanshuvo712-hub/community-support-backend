@@ -1,3 +1,4 @@
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
@@ -98,4 +99,15 @@ export async function buildApp() {
   );
 
   return app;
+}
+
+let cachedApp: ReturnType<typeof buildApp> | null = null;
+
+export default async function handler(req: IncomingMessage, res: ServerResponse) {
+  if (!cachedApp) {
+    cachedApp = buildApp();
+  }
+  const app = await cachedApp;
+  await app.ready();
+  app.server.emit('request', req, res);
 }
