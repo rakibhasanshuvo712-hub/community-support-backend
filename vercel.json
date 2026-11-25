@@ -13,7 +13,7 @@
   "services": {
     "community-support-api": {
       "root": ".",
-      "buildCommand": "npm ci && npm run build",
+      "buildCommand": "npm ci --include=dev && npm run build",
       "entrypoint": "dist/app.js"
     }
   }
