@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { AppError } from '../../lib/errors.js';
-import { getDb } from '../../lib/firebase.js';
+import { getAdminAuth, getDb } from '../../lib/firebase.js';
 import { sanitizeText } from '../../lib/security.js';
 import { requireAdmin } from '../../middleware/auth.js';
 import {
@@ -62,7 +62,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     {
       schema: {
         tags: ['Admin'],
-        summary: 'Suspend or unsuspend a user account (admin only)',
+        summary: 'Ban (suspend) or unban a user account (admin only)',
       },
     },
     async (request) => {
@@ -71,7 +71,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       const body = adminSuspendUserSchema.parse(request.body);
 
       if (id === adminId) {
-        throw new AppError(400, 'BAD_REQUEST', 'You cannot suspend your own admin account');
+        throw new AppError(400, 'BAD_REQUEST', 'You cannot ban your own admin account');
       }
 
       const db = getDb();
@@ -86,6 +86,14 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         updated_at: now,
       };
       await ref.update(updates);
+
+      if (body.is_suspended) {
+        try {
+          await getAdminAuth().revokeRefreshTokens(id);
+        } catch {
+          // Ignore if auth user was already deleted
+        }
+      }
 
       await db.collection('moderation_actions').add({
         admin_id: adminId,
@@ -155,17 +163,80 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
+  app.delete<{ Params: { id: string } }>(
+    '/posts/:id',
+    {
+      schema: {
+        tags: ['Admin'],
+        summary: 'Permanently delete any post (admin only)',
+      },
+    },
+    async (request) => {
+      const { id } = request.params;
+      const adminId = request.authUser!.id;
+      const db = getDb();
+      const ref = db.collection('posts').doc(id);
+      const snap = await ref.get();
+
+      if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'Post not found');
+      const existing = snap.data()!;
+      const now = new Date().toISOString();
+
+      await ref.delete();
+
+      await db.collection('moderation_actions').add({
+        admin_id: adminId,
+        action_type: 'remove_post',
+        target_post_id: id,
+        target_user_id: existing.author_id ?? null,
+        reason: `Deleted post "${existing.title}"`,
+        created_at: now,
+      });
+
+      if (existing.author_id) {
+        await createNotification({
+          userId: String(existing.author_id),
+          type: 'moderation',
+          title: 'Post deleted by administrator',
+          body: `Your post "${existing.title}" was deleted by an administrator.`,
+        });
+      }
+
+      return { success: true };
+    }
+  );
+
   app.get(
     '/reports',
     {
       schema: {
         tags: ['Admin'],
-        summary: 'List all user and post reports (admin only)',
+        summary: 'List all disputes, complaints, and reports (admin only)',
       },
     },
     async () => {
-      const snap = await getDb().collection('reports').orderBy('created_at', 'desc').limit(100).get();
-      return { reports: snap.docs.map((d) => ({ id: d.id, ...d.data() })) };
+      const db = getDb();
+      const snap = await db.collection('reports').orderBy('created_at', 'desc').limit(100).get();
+
+      const reports = await Promise.all(
+        snap.docs.map(async (d) => {
+          const r = d.data();
+          const [reporterSnap, targetUserSnap, targetPostSnap] = await Promise.all([
+            r.reporter_id ? db.collection('profiles').doc(String(r.reporter_id)).get() : Promise.resolve(null),
+            r.target_user_id ? db.collection('profiles').doc(String(r.target_user_id)).get() : Promise.resolve(null),
+            r.target_post_id ? db.collection('posts').doc(String(r.target_post_id)).get() : Promise.resolve(null),
+          ]);
+          return {
+            id: d.id,
+            ...r,
+            reporter_name: reporterSnap?.exists ? reporterSnap.data()?.full_name : 'Unknown',
+            target_user_name: targetUserSnap?.exists ? targetUserSnap.data()?.full_name : null,
+            target_post_title: targetPostSnap?.exists ? targetPostSnap.data()?.title : null,
+          };
+        })
+      );
+
+      return { reports };
     }
   );
 
@@ -174,7 +245,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     {
       schema: {
         tags: ['Admin'],
-        summary: 'Resolve or dismiss a report (admin only)',
+        summary: 'Handle, resolve, or dismiss a dispute/report (admin only)',
       },
     },
     async (request) => {
@@ -187,9 +258,11 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       const snap = await ref.get();
       if (!snap.exists) throw new AppError(404, 'NOT_FOUND', 'Report not found');
 
+      const existing = snap.data()!;
       const now = new Date().toISOString();
       const updates = {
         status: body.status,
+        resolution_note: sanitizeText(body.reason),
         resolved_by: adminId,
         resolved_at: body.status === 'reviewing' ? null : now,
       };
@@ -203,9 +276,37 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
           reason: sanitizeText(body.reason),
           created_at: now,
         });
+
+        if (existing.reporter_id) {
+          await createNotification({
+            userId: String(existing.reporter_id),
+            type: 'moderation',
+            title: `Dispute ${body.status}`,
+            body: `Your complaint ("${existing.reason}") was marked ${body.status}: ${sanitizeText(body.reason)}`,
+            link: '/dashboard',
+          });
+        }
       }
 
-      return { report: { id, ...snap.data(), ...updates } };
+      return { report: { id, ...existing, ...updates } };
+    }
+  );
+
+  app.get(
+    '/actions',
+    {
+      schema: {
+        tags: ['Admin'],
+        summary: 'List recent admin moderation actions (admin only)',
+      },
+    },
+    async () => {
+      const snap = await getDb()
+        .collection('moderation_actions')
+        .orderBy('created_at', 'desc')
+        .limit(50)
+        .get();
+      return { actions: snap.docs.map((d) => ({ id: d.id, ...d.data() })) };
     }
   );
 }

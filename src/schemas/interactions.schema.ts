@@ -22,9 +22,11 @@ export const sendMessageSchema = z.object({
 });
 
 export const createReportSchema = z.object({
-  target_type: z.enum(['post', 'user']),
+  target_type: z.enum(['post', 'user', 'dispute']),
   target_post_id: z.string().trim().min(1).max(128).nullable().optional(),
   target_user_id: z.string().trim().min(1).max(128).nullable().optional(),
+  claim_id: z.string().trim().min(1).max(128).nullable().optional(),
+  contribution_id: z.string().trim().min(1).max(128).nullable().optional(),
   reason: z.string().trim().min(3).max(150),
   details: z.string().trim().max(2000).optional(),
 });
