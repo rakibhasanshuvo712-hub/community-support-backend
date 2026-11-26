@@ -4,6 +4,7 @@ import { AppError } from '../../lib/errors.js';
 import { assertNoSensitiveFinancialData, sanitizeText } from '../../lib/security.js';
 import { authenticate } from '../../middleware/auth.js';
 import { createClaimSchema } from '../../schemas/interactions.schema.js';
+import { enqueueAndDispatchClaimAcceptedSms } from '../../services/applinkSms.service.js';
 import { createNotification } from '../../services/notifications.service.js';
 
 export async function claimRoutes(app: FastifyInstance): Promise<void> {
@@ -165,7 +166,12 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
         link: `/posts/${claim.post_id}`,
       });
 
-      return { claim };
+      const smsResult = await enqueueAndDispatchClaimAcceptedSms({
+        claimId: id,
+        recipientUserId: String(claim.claimant_id),
+      });
+
+      return { claim, sms_notification: smsResult };
     }
   );
 
@@ -250,65 +256,102 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
+      const client = await getPool().connect();
 
-      const res = await dbQuery<{
-        post_id: string;
-        claimant_id: string;
-        status: string;
-        donor_confirmed_handover: boolean;
-        recipient_confirmed_handover: boolean;
-        author_id: string;
-        post_type: string;
-        title: string;
-      }>(
-        `SELECT c.*, p.author_id, p.post_type, p.title
-         FROM claims c JOIN posts p ON p.id = c.post_id WHERE c.id = $1`,
-        [id]
-      );
-      const claim = res.rows[0];
-      if (!claim) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
-      if (claim.status !== 'accepted') {
-        throw new AppError(409, 'CONFLICT', 'Handover can only be confirmed for accepted claims');
+      let updatedClaim;
+      let otherUserId: string;
+      let postTitle: string;
+      let postId: string;
+      let bothConfirmed = false;
+      let newlyConfirmed = false;
+
+      try {
+        await client.query('BEGIN');
+        const res = await client.query<{
+          post_id: string;
+          claimant_id: string;
+          status: string;
+          donor_confirmed_handover: boolean;
+          recipient_confirmed_handover: boolean;
+          author_id: string;
+          post_type: string;
+          title: string;
+        }>(
+          `SELECT c.*, p.author_id, p.post_type, p.title
+           FROM claims c JOIN posts p ON p.id = c.post_id WHERE c.id = $1 FOR UPDATE OF c`,
+          [id]
+        );
+        const claim = res.rows[0];
+        if (!claim) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
+
+        const isOwner = claim.author_id === userId;
+        const isClaimant = claim.claimant_id === userId;
+        if (!isOwner && !isClaimant) {
+          throw new AppError(403, 'FORBIDDEN', 'You are not a participant in this claim');
+        }
+
+        if (claim.status === 'completed') {
+          await client.query('COMMIT');
+          return { claim };
+        }
+        if (claim.status !== 'accepted') {
+          throw new AppError(409, 'CONFLICT', 'Handover can only be confirmed for accepted claims');
+        }
+
+        const isUserDonor =
+          (claim.post_type === 'donation_offer' && isOwner) ||
+          (claim.post_type === 'help_request' && isClaimant);
+
+        const alreadyConfirmedByMe = isUserDonor
+          ? claim.donor_confirmed_handover
+          : claim.recipient_confirmed_handover;
+
+        if (alreadyConfirmedByMe) {
+          await client.query('COMMIT');
+          return { claim };
+        }
+
+        const nextDonor = isUserDonor ? true : claim.donor_confirmed_handover;
+        const nextRecipient = !isUserDonor ? true : claim.recipient_confirmed_handover;
+        bothConfirmed = nextDonor && nextRecipient;
+        newlyConfirmed = true;
+        otherUserId = isOwner ? claim.claimant_id : claim.author_id;
+        postTitle = claim.title;
+        postId = claim.post_id;
+
+        const updated = await client.query(
+          `UPDATE claims
+           SET donor_confirmed_handover = $1,
+               recipient_confirmed_handover = $2,
+               status = $3,
+               confirmed_at = $4,
+               updated_at = NOW()
+           WHERE id = $5
+           RETURNING *`,
+          [nextDonor, nextRecipient, bothConfirmed ? 'completed' : 'accepted', bothConfirmed ? new Date().toISOString() : null, id]
+        );
+        updatedClaim = updated.rows[0];
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
       }
 
-      const isOwner = claim.author_id === userId;
-      const isClaimant = claim.claimant_id === userId;
-      if (!isOwner && !isClaimant) {
-        throw new AppError(403, 'FORBIDDEN', 'You are not a participant in this claim');
+      if (newlyConfirmed) {
+        await createNotification({
+          userId: otherUserId!,
+          type: 'contribution_confirmed',
+          title: bothConfirmed ? 'Handover completed!' : 'Handover confirmation pending',
+          body: bothConfirmed
+            ? `Both parties confirmed the handover for "${postTitle!}".`
+            : `The other party confirmed handover for "${postTitle!}". Please confirm when ready.`,
+          link: `/posts/${postId!}`,
+        });
       }
 
-      const isUserDonor =
-        (claim.post_type === 'donation_offer' && isOwner) ||
-        (claim.post_type === 'help_request' && isClaimant);
-
-      const nextDonor = isUserDonor ? true : claim.donor_confirmed_handover;
-      const nextRecipient = !isUserDonor ? true : claim.recipient_confirmed_handover;
-      const both = nextDonor && nextRecipient;
-
-      const updated = await dbQuery(
-        `UPDATE claims
-         SET donor_confirmed_handover = $1,
-             recipient_confirmed_handover = $2,
-             status = $3,
-             confirmed_at = $4,
-             updated_at = NOW()
-         WHERE id = $5
-         RETURNING *`,
-        [nextDonor, nextRecipient, both ? 'completed' : 'accepted', both ? new Date().toISOString() : null, id]
-      );
-
-      const otherUserId = isOwner ? claim.claimant_id : claim.author_id;
-      await createNotification({
-        userId: otherUserId,
-        type: 'contribution_confirmed',
-        title: both ? 'Handover completed!' : 'Handover confirmation pending',
-        body: both
-          ? `Both parties confirmed the handover for "${claim.title}".`
-          : `The other party confirmed handover for "${claim.title}". Please confirm when ready.`,
-        link: `/posts/${claim.post_id}`,
-      });
-
-      return { claim: updated.rows[0] };
+      return { claim: updatedClaim };
     }
   );
 }

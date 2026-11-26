@@ -3,6 +3,11 @@ import { z } from 'zod';
 
 dotenv.config();
 
+const boolFlag = z
+  .enum(['true', 'false', '1', '0', ''])
+  .default('false')
+  .transform((v) => v === 'true' || v === '1');
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(4000),
@@ -14,6 +19,17 @@ const envSchema = z.object({
   CORS_ORIGINS: z.string().default('http://localhost:3000'),
   RATE_LIMIT_MAX: z.coerce.number().int().positive().default(100),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+
+  // Applink (backend-only)
+  APPLINK_FEATURES_ENABLED: boolFlag,
+  APPLINK_OTP_ENABLED: boolFlag,
+  APPLINK_DELIVERY_REPORTS_ENABLED: boolFlag,
+  APPLINK_APP_ID: z.string().trim().default(''),
+  APPLINK_PASSWORD: z.string().trim().default(''),
+  APPLINK_SMS_SEND_URL: z.string().trim().default(''),
+  APPLINK_OTP_REQUEST_URL: z.string().trim().default(''),
+  APPLINK_OTP_VERIFY_URL: z.string().trim().default(''),
+  APPLINK_SUBSCRIPTION_SEND_URL: z.string().trim().default(''),
 });
 
 const parsed = envSchema.safeParse(process.env);

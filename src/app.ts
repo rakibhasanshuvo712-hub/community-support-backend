@@ -7,8 +7,10 @@ import rateLimit from '@fastify/rate-limit';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 import { env } from './config/env.js';
+import { getApplinkConfig } from './integrations/applink/config.js';
 import { errorHandler } from './lib/errors.js';
 import { adminRoutes } from './routes/v1/admin.js';
+import { applinkRoutes } from './routes/v1/applink.js';
 import { authRoutes } from './routes/v1/auth.js';
 import { categoryRoutes } from './routes/v1/categories.js';
 import { claimRoutes } from './routes/v1/claims.js';
@@ -22,6 +24,9 @@ import { profileRoutes } from './routes/v1/profiles.js';
 import { reportRoutes } from './routes/v1/reports.js';
 
 export async function buildApp() {
+  // Validate Applink config at startup (fails loudly if URL is set without credentials)
+  getApplinkConfig();
+
   const app = Fastify({
     logger: env.NODE_ENV !== 'test',
     trustProxy: true,
@@ -105,6 +110,7 @@ export async function buildApp() {
       await v1.register(notificationRoutes, { prefix: '/notifications' });
       await v1.register(reportRoutes, { prefix: '/reports' });
       await v1.register(adminRoutes, { prefix: '/admin' });
+      await v1.register(applinkRoutes, { prefix: '/applink' });
     },
     { prefix: '/api/v1' }
   );

@@ -256,6 +256,79 @@ export async function ensureSchemaMigrated(): Promise<void> {
         reason TEXT NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS applink_subscriber_bindings (
+        user_id UUID PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
+        normalized_msisdn TEXT NOT NULL,
+        subscriber_id TEXT NOT NULL,
+        subscription_status TEXT NOT NULL DEFAULT 'UNREGISTERED',
+        binding_mode TEXT NOT NULL CHECK (binding_mode IN ('mock', 'live')),
+        consent_wording TEXT NOT NULL,
+        consent_channel TEXT NOT NULL,
+        consented_at TIMESTAMPTZ NOT NULL,
+        last_confirmed_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS applink_otp_challenges (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        normalized_msisdn TEXT NOT NULL,
+        provider_mode TEXT NOT NULL CHECK (provider_mode IN ('mock', 'live')),
+        reference_no TEXT NOT NULL,
+        consent_wording TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'verified', 'expired', 'locked')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 5,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        verified_at TIMESTAMPTZ
+      );
+
+      CREATE TABLE IF NOT EXISTS applink_sms_outbox (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_event_key TEXT NOT NULL UNIQUE,
+        recipient_user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        claim_id UUID REFERENCES claims(id) ON DELETE SET NULL,
+        subscriber_id TEXT NOT NULL,
+        transport_mode TEXT NOT NULL CHECK (transport_mode IN ('mock', 'live')),
+        message_body TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('queued', 'simulated', 'provider_accepted', 'delivered', 'failed', 'unknown')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 3,
+        provider_request_id TEXT,
+        provider_message_id TEXT,
+        provider_status_code TEXT,
+        provider_status_detail TEXT,
+        delivery_status TEXT,
+        last_error TEXT,
+        next_retry_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_applink_sms_outbox_request_id
+        ON applink_sms_outbox(provider_request_id);
+
+      CREATE TABLE IF NOT EXISTS applink_delivery_reports (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        request_id TEXT NOT NULL,
+        destination_address TEXT NOT NULL,
+        delivery_status TEXT NOT NULL,
+        raw_delivery_status TEXT NOT NULL,
+        event_timestamp TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS applink_subscription_events (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        subscriber_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        event_timestamp TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
     `);
 
     for (const cat of DEFAULT_CATEGORIES) {
