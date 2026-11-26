@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { isDatabaseConfigured } from '../../config/env.js';
-import { dbQuery } from '../../lib/db.js';
 import { AppError } from '../../lib/errors.js';
+import { getDb, newId } from '../../lib/mongo.js';
 import { assertNoSensitiveFinancialData, sanitizeText } from '../../lib/security.js';
 import { authenticate, optionalAuth, signFileToken } from '../../middleware/auth.js';
 import {
@@ -25,18 +25,21 @@ async function isAuthorizedForPrivatePostDetails(
   if (!userId) return false;
   if (userId === authorId || role === 'admin') return true;
 
-  const [claimsRes, contribRes] = await Promise.all([
-    dbQuery(
-      `SELECT id FROM claims WHERE post_id = $1 AND claimant_id = $2 AND status IN ('accepted', 'completed') LIMIT 1`,
-      [postId, userId]
-    ),
-    dbQuery(
-      `SELECT id FROM contributions WHERE post_id = $1 AND contributor_id = $2 AND status IN ('pledged', 'confirmed') LIMIT 1`,
-      [postId, userId]
-    ),
+  const db = await getDb();
+  const [claim, contrib] = await Promise.all([
+    db.collection('claims').findOne({
+      post_id: postId,
+      claimant_id: userId,
+      status: { $in: ['accepted', 'completed'] },
+    }),
+    db.collection('contributions').findOne({
+      post_id: postId,
+      contributor_id: userId,
+      status: { $in: ['pledged', 'confirmed'] },
+    }),
   ]);
 
-  return claimsRes.rows.length > 0 || contribRes.rows.length > 0;
+  return Boolean(claim || contrib);
 }
 
 export async function postRoutes(app: FastifyInstance): Promise<void> {
@@ -58,94 +61,76 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const query = listPostsQuerySchema.parse(request.query);
-      const conditions: string[] = [];
-      const params: unknown[] = [];
+      const db = await getDb();
 
-      if (query.status) {
-        params.push(query.status);
-        conditions.push(`p.status = $${params.length}`);
-      } else {
-        conditions.push(`p.status IN ('active', 'fulfilled')`);
-      }
-
-      if (query.post_type) {
-        params.push(query.post_type);
-        conditions.push(`p.post_type = $${params.length}`);
-      }
-      if (query.donation_type) {
-        params.push(query.donation_type);
-        conditions.push(`p.donation_type = $${params.length}`);
-      }
-      if (query.urgency) {
-        params.push(query.urgency);
-        conditions.push(`p.urgency = $${params.length}`);
-      }
-      if (query.category_id) {
-        params.push(query.category_id);
-        conditions.push(`p.category_id = $${params.length}`);
-      }
-      if (query.category_slug) {
-        params.push(query.category_slug);
-        conditions.push(`c.slug = $${params.length}`);
-      }
-      if (query.city) {
-        params.push(`%${query.city}%`);
-        conditions.push(`p.location_city ILIKE $${params.length}`);
-      }
+      const filter: Record<string, unknown> = {
+        status: query.status ? query.status : { $in: ['active', 'fulfilled'] },
+      };
+      if (query.post_type) filter.post_type = query.post_type;
+      if (query.donation_type) filter.donation_type = query.donation_type;
+      if (query.urgency) filter.urgency = query.urgency;
+      if (query.category_id) filter.category_id = query.category_id;
+      if (query.category_slug) filter.category_id = query.category_slug;
+      if (query.city) filter.location_city = { $regex: query.city, $options: 'i' };
       if (query.q) {
-        params.push(`%${query.q}%`);
-        conditions.push(
-          `(p.title ILIKE $${params.length} OR p.description ILIKE $${params.length} OR p.location_city ILIKE $${params.length})`
-        );
+        const rx = { $regex: query.q, $options: 'i' };
+        filter.$or = [{ title: rx }, { description: rx }, { location_city: rx }];
       }
 
-      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-      const orderClause =
-        query.sort === 'urgent'
-          ? `ORDER BY CASE p.urgency WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END ASC, p.created_at DESC`
-          : query.sort === 'relevant'
-            ? `ORDER BY p.view_count DESC, p.created_at DESC`
-            : `ORDER BY p.created_at DESC`;
+      const allMatching = await db
+        .collection('posts')
+        .find(filter, { projection: { _id: 0 } })
+        .sort({ created_at: -1 })
+        .limit(200)
+        .toArray();
 
-      const countRes = await dbQuery<{ count: string }>(
-        `SELECT COUNT(*)::text AS count FROM posts p JOIN categories c ON c.id = p.category_id ${whereClause}`,
-        params
-      );
-      const total = Number(countRes.rows[0]?.count ?? 0);
+      if (query.sort === 'urgent') {
+        const rank: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+        allMatching.sort((a, b) => (rank[String(a.urgency)] ?? 9) - (rank[String(b.urgency)] ?? 9));
+      } else if (query.sort === 'relevant') {
+        allMatching.sort((a, b) => Number(b.view_count || 0) - Number(a.view_count || 0));
+      }
 
+      const total = allMatching.length;
       const offset = (query.page - 1) * query.limit;
-      const listParams = [...params, query.limit, offset];
+      const paged = allMatching.slice(offset, offset + query.limit);
 
-      const listRes = await dbQuery(
-        `SELECT p.*,
-                json_build_object('id', pr.id, 'full_name', pr.full_name, 'location_city', pr.location_city) AS author,
-                json_build_object('id', c.id, 'slug', c.slug, 'name_en', c.name_en, 'name_bn', c.name_bn, 'icon', c.icon, 'is_restricted', c.is_restricted) AS category,
-                COALESCE(
-                  (SELECT json_agg(json_build_object('id', pi.id, 'file_id', pi.file_id, 'sort_order', pi.sort_order) ORDER BY pi.sort_order ASC)
-                   FROM post_images pi WHERE pi.post_id = p.id),
-                  '[]'::json
-                ) AS raw_images
-         FROM posts p
-         JOIN profiles pr ON pr.id = p.author_id
-         JOIN categories c ON c.id = p.category_id
-         ${whereClause}
-         ${orderClause}
-         LIMIT $${listParams.length - 1} OFFSET $${listParams.length}`,
-        listParams
-      );
+      const [cats, profiles, images] = await Promise.all([
+        db.collection('categories').find({}, { projection: { _id: 0 } }).toArray(),
+        db
+          .collection('profiles')
+          .find(
+            { id: { $in: paged.map((p) => String(p.author_id)) } },
+            { projection: { _id: 0, id: 1, full_name: 1, location_city: 1 } }
+          )
+          .toArray(),
+        db
+          .collection('post_images')
+          .find(
+            { post_id: { $in: paged.map((p) => String(p.id)) } },
+            { projection: { _id: 0 } }
+          )
+          .sort({ sort_order: 1 })
+          .toArray(),
+      ]);
 
+      const catMap = new Map(cats.map((c) => [String(c.id), c]));
+      const profMap = new Map(profiles.map((p) => [String(p.id), p]));
       const baseUrl = `${request.protocol}://${request.headers.host}`;
-      const posts = listRes.rows.map((row) => {
-        const rawImages = (row.raw_images as Array<{ id: string; file_id: string; sort_order: number }>) ?? [];
-        const rest = { ...row };
-        delete rest.raw_images;
-        return {
-          ...rest,
-          images: rawImages.map((img) => ({
+
+      const posts = paged.map((post) => {
+        const postImgs = images
+          .filter((img) => img.post_id === post.id)
+          .map((img) => ({
             id: img.id,
             sort_order: img.sort_order,
-            url: `${baseUrl}/api/v1/files/${img.file_id}`,
-          })),
+            url: `${baseUrl}/api/v1/files/${String(img.file_id)}`,
+          }));
+        return {
+          ...post,
+          author: profMap.get(String(post.author_id)) ?? null,
+          category: catMap.get(String(post.category_id)) ?? null,
+          images: postImgs,
         };
       });
 
@@ -172,16 +157,22 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const res = await dbQuery(
-        `SELECT p.*,
-                json_build_object('id', c.id, 'slug', c.slug, 'name_en', c.name_en, 'name_bn', c.name_bn, 'icon', c.icon, 'is_restricted', c.is_restricted) AS category
-         FROM posts p
-         JOIN categories c ON c.id = p.category_id
-         WHERE p.author_id = $1 AND p.status <> 'removed'
-         ORDER BY p.created_at DESC`,
-        [userId]
-      );
-      return { posts: res.rows };
+      const db = await getDb();
+      const [rows, cats] = await Promise.all([
+        db
+          .collection('posts')
+          .find({ author_id: userId, status: { $ne: 'removed' } }, { projection: { _id: 0 } })
+          .sort({ created_at: -1 })
+          .toArray(),
+        db.collection('categories').find({}, { projection: { _id: 0 } }).toArray(),
+      ]);
+      const catMap = new Map(cats.map((c) => [String(c.id), c]));
+      return {
+        posts: rows.map((p) => ({
+          ...p,
+          category: catMap.get(String(p.category_id)) ?? null,
+        })),
+      };
     }
   );
 
@@ -205,11 +196,8 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         body.contact_note
       );
 
-      const catRes = await dbQuery<{ id: string; is_restricted: boolean }>(
-        'SELECT id, is_restricted FROM categories WHERE id = $1',
-        [body.category_id]
-      );
-      const category = catRes.rows[0];
+      const db = await getDb();
+      const category = await db.collection('categories').findOne({ id: body.category_id });
       if (!category) {
         throw new AppError(400, 'VALIDATION_ERROR', 'Invalid category selected');
       }
@@ -224,44 +212,41 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, 'VALIDATION_ERROR', 'Target or offered amount is required for monetary posts');
       }
 
-      const insertRes = await dbQuery<{ id: string }>(
-        `INSERT INTO posts (
-          author_id, post_type, donation_type, category_id, title, description,
-          quantity, unit, amount, currency, location_city, location_area,
-          urgency, status, safety_acknowledged, expires_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'active',$14,$15)
-        RETURNING *`,
-        [
-          userId,
-          body.post_type,
-          body.donation_type,
-          body.category_id,
-          sanitizeText(body.title),
-          sanitizeText(body.description),
-          body.quantity ?? null,
-          body.unit ? sanitizeText(body.unit) : null,
-          body.amount ?? null,
-          body.currency.toUpperCase(),
-          sanitizeText(body.location_city),
-          body.location_area ? sanitizeText(body.location_area) : null,
-          body.urgency,
-          body.safety_acknowledged,
-          body.expires_at ?? null,
-        ]
-      );
+      const now = new Date().toISOString();
+      const postId = newId();
+      const post = {
+        id: postId,
+        author_id: userId,
+        post_type: body.post_type,
+        donation_type: body.donation_type,
+        category_id: body.category_id,
+        title: sanitizeText(body.title),
+        description: sanitizeText(body.description),
+        quantity: body.quantity ?? null,
+        unit: body.unit ? sanitizeText(body.unit) : null,
+        amount: body.amount ?? null,
+        currency: body.currency.toUpperCase(),
+        location_city: sanitizeText(body.location_city),
+        location_area: body.location_area ? sanitizeText(body.location_area) : null,
+        urgency: body.urgency,
+        status: 'active',
+        safety_acknowledged: body.safety_acknowledged,
+        expires_at: body.expires_at ?? null,
+        view_count: 0,
+        created_at: now,
+        updated_at: now,
+      };
 
-      const post = insertRes.rows[0]!;
+      await db.collection('posts').insertOne({ ...post });
+
       if (body.exact_handover_address || body.contact_phone || body.contact_note) {
-        await dbQuery(
-          `INSERT INTO post_private_details (post_id, exact_handover_address, contact_phone, contact_note)
-           VALUES ($1, $2, $3, $4)`,
-          [
-            post.id,
-            body.exact_handover_address ? sanitizeText(body.exact_handover_address) : null,
-            body.contact_phone ? sanitizeText(body.contact_phone) : null,
-            body.contact_note ? sanitizeText(body.contact_note) : null,
-          ]
-        );
+        await db.collection('post_private_details').insertOne({
+          post_id: postId,
+          exact_handover_address: body.exact_handover_address ? sanitizeText(body.exact_handover_address) : null,
+          contact_phone: body.contact_phone ? sanitizeText(body.contact_phone) : null,
+          contact_note: body.contact_note ? sanitizeText(body.contact_note) : null,
+          updated_at: now,
+        });
       }
 
       return reply.status(201).send({ post });
@@ -279,18 +264,8 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const { id } = request.params;
-      const res = await dbQuery(
-        `SELECT p.*,
-                json_build_object('id', pr.id, 'full_name', pr.full_name, 'bio', pr.bio, 'location_city', pr.location_city, 'location_area', pr.location_area) AS author,
-                json_build_object('id', c.id, 'slug', c.slug, 'name_en', c.name_en, 'name_bn', c.name_bn, 'icon', c.icon, 'is_restricted', c.is_restricted, 'restriction_note_en', c.restriction_note_en, 'restriction_note_bn', c.restriction_note_bn) AS category
-         FROM posts p
-         JOIN profiles pr ON pr.id = p.author_id
-         JOIN categories c ON c.id = p.category_id
-         WHERE p.id = $1`,
-        [id]
-      );
-
-      const post = res.rows[0];
+      const db = await getDb();
+      const post = await db.collection('posts').findOne({ id }, { projection: { _id: 0 } });
       if (!post) throw new AppError(404, 'NOT_FOUND', 'Post not found');
 
       const isOwnerOrAdmin =
@@ -299,18 +274,28 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(404, 'NOT_FOUND', 'Post not available');
       }
 
-      void dbQuery('UPDATE posts SET view_count = view_count + 1 WHERE id = $1', [id]);
+      void db.collection('posts').updateOne({ id }, { $inc: { view_count: 1 } });
 
-      const imgRes = await dbQuery<{ id: string; file_id: string; sort_order: number }>(
-        'SELECT id, file_id, sort_order FROM post_images WHERE post_id = $1 ORDER BY sort_order ASC',
-        [id]
-      );
+      const [author, category, rawImages] = await Promise.all([
+        db
+          .collection('profiles')
+          .findOne(
+            { id: String(post.author_id) },
+            { projection: { _id: 0, id: 1, full_name: 1, bio: 1, location_city: 1, location_area: 1 } }
+          ),
+        db.collection('categories').findOne({ id: String(post.category_id) }, { projection: { _id: 0 } }),
+        db
+          .collection('post_images')
+          .find({ post_id: id }, { projection: { _id: 0 } })
+          .sort({ sort_order: 1 })
+          .toArray(),
+      ]);
 
       const baseUrl = `${request.protocol}://${request.headers.host}`;
-      const images = imgRes.rows.map((img) => ({
+      const images = rawImages.map((img) => ({
         id: img.id,
         sort_order: img.sort_order,
-        url: `${baseUrl}/api/v1/files/${img.file_id}`,
+        url: `${baseUrl}/api/v1/files/${String(img.file_id)}`,
       }));
 
       const authorizedForPrivate = await isAuthorizedForPrivatePostDetails(
@@ -324,44 +309,41 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
       let privateDocuments: Array<Record<string, unknown>> = [];
 
       if (authorizedForPrivate) {
-        const [privRes, docsRes] = await Promise.all([
-          dbQuery(
-            'SELECT exact_handover_address, contact_phone, contact_note FROM post_private_details WHERE post_id = $1',
-            [id]
-          ),
-          dbQuery(
-            'SELECT id, file_id, file_name, mime_type, size_bytes, created_at FROM private_documents WHERE post_id = $1',
-            [id]
-          ),
+        const [priv, docs] = await Promise.all([
+          db.collection('post_private_details').findOne({ post_id: id }, { projection: { _id: 0 } }),
+          db.collection('private_documents').find({ post_id: id }, { projection: { _id: 0 } }).toArray(),
         ]);
-        privateDetails = privRes.rows[0] ?? null;
-        privateDocuments = docsRes.rows.map((d) => ({
+        privateDetails = priv ?? null;
+        privateDocuments = docs.map((d) => ({
           id: d.id,
           file_name: d.file_name,
           mime_type: d.mime_type,
           size_bytes: d.size_bytes,
-          signed_url: `${baseUrl}/api/v1/files/${d.file_id}?token=${signFileToken(String(d.file_id))}`,
+          signed_url: `${baseUrl}/api/v1/files/${String(d.file_id)}?token=${signFileToken(String(d.file_id))}`,
           created_at: d.created_at,
         }));
       }
 
       let monetarySummary: { pledged_total: number; confirmed_total: number } | null = null;
       if (post.donation_type === 'money') {
-        const sumRes = await dbQuery<{ status: string; total: string }>(
-          `SELECT status, COALESCE(SUM(amount), 0)::text AS total
-           FROM contributions
-           WHERE post_id = $1 AND status IN ('pledged', 'confirmed')
-           GROUP BY status`,
-          [id]
-        );
-        const pledged = Number(sumRes.rows.find((r) => r.status === 'pledged')?.total ?? 0);
-        const confirmed = Number(sumRes.rows.find((r) => r.status === 'confirmed')?.total ?? 0);
+        const contribs = await db
+          .collection('contributions')
+          .find({ post_id: id, status: { $in: ['pledged', 'confirmed'] } })
+          .toArray();
+        const pledged = contribs
+          .filter((c) => c.status === 'pledged')
+          .reduce((sum, c) => sum + Number(c.amount || 0), 0);
+        const confirmed = contribs
+          .filter((c) => c.status === 'confirmed')
+          .reduce((sum, c) => sum + Number(c.amount || 0), 0);
         monetarySummary = { pledged_total: pledged, confirmed_total: confirmed };
       }
 
       return {
         post: {
           ...post,
+          author,
+          category,
           images,
           monetary_summary: monetarySummary,
           can_view_private_details: authorizedForPrivate,
@@ -393,11 +375,8 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         body.contact_note
       );
 
-      const existingRes = await dbQuery<{ id: string; author_id: string; status: string; title: string }>(
-        'SELECT id, author_id, status, title FROM posts WHERE id = $1',
-        [id]
-      );
-      const existing = existingRes.rows[0];
+      const db = await getDb();
+      const existing = await db.collection('posts').findOne({ id });
       if (!existing) throw new AppError(404, 'NOT_FOUND', 'Post not found');
       if (existing.author_id !== userId && request.authUser!.role !== 'admin') {
         throw new AppError(403, 'FORBIDDEN', 'You can only edit your own posts');
@@ -406,77 +385,62 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(403, 'FORBIDDEN', 'Removed posts cannot be edited');
       }
 
-      const updatedRes = await dbQuery(
-        `UPDATE posts
-         SET title = COALESCE($1, title),
-             description = COALESCE($2, description),
-             quantity = COALESCE($3, quantity),
-             unit = COALESCE($4, unit),
-             amount = COALESCE($5, amount),
-             currency = COALESCE($6, currency),
-             location_city = COALESCE($7, location_city),
-             location_area = COALESCE($8, location_area),
-             urgency = COALESCE($9, urgency),
-             status = COALESCE($10, status),
-             expires_at = COALESCE($11, expires_at),
-             updated_at = NOW()
-         WHERE id = $12
-         RETURNING *`,
-        [
-          body.title !== undefined ? sanitizeText(body.title) : null,
-          body.description !== undefined ? sanitizeText(body.description) : null,
-          body.quantity ?? null,
-          body.unit !== undefined ? (body.unit ? sanitizeText(body.unit) : null) : null,
-          body.amount ?? null,
-          body.currency ? body.currency.toUpperCase() : null,
-          body.location_city !== undefined ? sanitizeText(body.location_city) : null,
-          body.location_area !== undefined ? (body.location_area ? sanitizeText(body.location_area) : null) : null,
-          body.urgency ?? null,
-          body.status ?? null,
-          body.expires_at ?? null,
-          id,
-        ]
-      );
+      const now = new Date().toISOString();
+      const updates: Record<string, unknown> = { updated_at: now };
+      if (body.title !== undefined) updates.title = sanitizeText(body.title);
+      if (body.description !== undefined) updates.description = sanitizeText(body.description);
+      if (body.quantity !== undefined) updates.quantity = body.quantity;
+      if (body.unit !== undefined) updates.unit = body.unit ? sanitizeText(body.unit) : null;
+      if (body.amount !== undefined) updates.amount = body.amount;
+      if (body.currency !== undefined) updates.currency = body.currency.toUpperCase();
+      if (body.location_city !== undefined) updates.location_city = sanitizeText(body.location_city);
+      if (body.location_area !== undefined) updates.location_area = body.location_area ? sanitizeText(body.location_area) : null;
+      if (body.urgency !== undefined) updates.urgency = body.urgency;
+      if (body.status !== undefined) updates.status = body.status;
+      if (body.expires_at !== undefined) updates.expires_at = body.expires_at;
+
+      await db.collection('posts').updateOne({ id }, { $set: updates });
 
       if (
         body.exact_handover_address !== undefined ||
         body.contact_phone !== undefined ||
         body.contact_note !== undefined
       ) {
-        await dbQuery(
-          `INSERT INTO post_private_details (post_id, exact_handover_address, contact_phone, contact_note)
-           VALUES ($1, $2, $3, $4)
-           ON CONFLICT (post_id) DO UPDATE
-           SET exact_handover_address = COALESCE($2, post_private_details.exact_handover_address),
-               contact_phone = COALESCE($3, post_private_details.contact_phone),
-               contact_note = COALESCE($4, post_private_details.contact_note),
-               updated_at = NOW()`,
-          [
-            id,
-            body.exact_handover_address !== undefined ? (body.exact_handover_address ? sanitizeText(body.exact_handover_address) : null) : null,
-            body.contact_phone !== undefined ? (body.contact_phone ? sanitizeText(body.contact_phone) : null) : null,
-            body.contact_note !== undefined ? (body.contact_note ? sanitizeText(body.contact_note) : null) : null,
-          ]
+        const privSet: Record<string, unknown> = { updated_at: now };
+        if (body.exact_handover_address !== undefined) {
+          privSet.exact_handover_address = body.exact_handover_address ? sanitizeText(body.exact_handover_address) : null;
+        }
+        if (body.contact_phone !== undefined) {
+          privSet.contact_phone = body.contact_phone ? sanitizeText(body.contact_phone) : null;
+        }
+        if (body.contact_note !== undefined) {
+          privSet.contact_note = body.contact_note ? sanitizeText(body.contact_note) : null;
+        }
+        await db.collection('post_private_details').updateOne(
+          { post_id: id },
+          { $set: privSet, $setOnInsert: { post_id: id } },
+          { upsert: true }
         );
       }
 
       if (body.status && body.status !== existing.status) {
-        const claimsRes = await dbQuery<{ claimant_id: string }>(
-          `SELECT claimant_id FROM claims WHERE post_id = $1 AND status IN ('pending', 'accepted')`,
-          [id]
-        );
-        for (const c of claimsRes.rows) {
+        const claims = await db
+          .collection('claims')
+          .find({ post_id: id, status: { $in: ['pending', 'accepted'] } })
+          .toArray();
+        for (const c of claims) {
           await createNotification({
-            userId: c.claimant_id,
+            userId: String(c.claimant_id),
             type: 'post_status_changed',
             title: 'Post status updated',
-            body: `"${existing.title}" is now marked as ${body.status}.`,
+            body: `"${String(existing.title)}" is now marked as ${body.status}.`,
             link: `/posts/${id}`,
           });
         }
       }
 
-      return { post: updatedRes.rows[0] };
+      const updated = await db.collection('posts').findOne({ id }, { projection: { _id: 0 } });
+      return { post: updated };
     }
   );
 
@@ -492,13 +456,13 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
-      const existingRes = await dbQuery<{ author_id: string }>('SELECT author_id FROM posts WHERE id = $1', [id]);
-      const existing = existingRes.rows[0];
+      const db = await getDb();
+      const existing = await db.collection('posts').findOne({ id });
       if (!existing) throw new AppError(404, 'NOT_FOUND', 'Post not found');
       if (existing.author_id !== userId && request.authUser!.role !== 'admin') {
         throw new AppError(403, 'FORBIDDEN', 'You can only delete your own posts');
       }
-      await dbQuery('DELETE FROM posts WHERE id = $1', [id]);
+      await db.collection('posts').deleteOne({ id });
       return { success: true };
     }
   );
@@ -515,9 +479,8 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
     async (request, reply) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
-
-      const postRes = await dbQuery<{ author_id: string }>('SELECT author_id FROM posts WHERE id = $1', [id]);
-      const post = postRes.rows[0];
+      const db = await getDb();
+      const post = await db.collection('posts').findOne({ id });
       if (!post) throw new AppError(404, 'NOT_FOUND', 'Post not found');
       if (post.author_id !== userId) throw new AppError(403, 'FORBIDDEN', 'Only the post owner can upload images');
 
@@ -532,26 +495,34 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, 'VALIDATION_ERROR', 'Image must be 5MB or smaller');
       }
 
-      const blobRes = await dbQuery<{ id: string }>(
-        `INSERT INTO file_blobs (owner_id, bucket, file_name, mime_type, size_bytes, data)
-         VALUES ($1, 'post-images', $2, $3, $4, $5)
-         RETURNING id`,
-        [userId, file.filename || 'image', file.mimetype, buffer.length, buffer]
-      );
-      const fileId = blobRes.rows[0]!.id;
+      const fileId = newId();
+      const now = new Date().toISOString();
+      await db.collection('file_blobs').insertOne({
+        id: fileId,
+        owner_id: userId,
+        bucket: 'post-images',
+        file_name: file.filename || 'image',
+        mime_type: file.mimetype,
+        size_bytes: buffer.length,
+        data: buffer,
+        created_at: now,
+      });
 
-      const imgRes = await dbQuery<{ id: string; sort_order: number }>(
-        `INSERT INTO post_images (post_id, file_id, sort_order)
-         VALUES ($1, $2, (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM post_images WHERE post_id = $1))
-         RETURNING id, sort_order`,
-        [id, fileId]
-      );
+      const count = await db.collection('post_images').countDocuments({ post_id: id });
+      const imgId = newId();
+      await db.collection('post_images').insertOne({
+        id: imgId,
+        post_id: id,
+        file_id: fileId,
+        sort_order: count,
+        created_at: now,
+      });
 
       const baseUrl = `${request.protocol}://${request.headers.host}`;
       return reply.status(201).send({
         image: {
-          id: imgRes.rows[0]!.id,
-          sort_order: imgRes.rows[0]!.sort_order,
+          id: imgId,
+          sort_order: count,
           url: `${baseUrl}/api/v1/files/${fileId}`,
         },
       });
@@ -570,9 +541,8 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
     async (request, reply) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
-
-      const postRes = await dbQuery<{ author_id: string }>('SELECT author_id FROM posts WHERE id = $1', [id]);
-      const post = postRes.rows[0];
+      const db = await getDb();
+      const post = await db.collection('posts').findOne({ id });
       if (!post) throw new AppError(404, 'NOT_FOUND', 'Post not found');
       if (post.author_id !== userId) throw new AppError(403, 'FORBIDDEN', 'Only the post owner can upload documents');
 
@@ -588,22 +558,32 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const safeName = file.filename.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 100);
-      const blobRes = await dbQuery<{ id: string }>(
-        `INSERT INTO file_blobs (owner_id, bucket, file_name, mime_type, size_bytes, data)
-         VALUES ($1, 'private-documents', $2, $3, $4, $5)
-         RETURNING id`,
-        [userId, safeName, file.mimetype, buffer.length, buffer]
-      );
-      const fileId = blobRes.rows[0]!.id;
+      const fileId = newId();
+      const now = new Date().toISOString();
+      await db.collection('file_blobs').insertOne({
+        id: fileId,
+        owner_id: userId,
+        bucket: 'private-documents',
+        file_name: safeName,
+        mime_type: file.mimetype,
+        size_bytes: buffer.length,
+        data: buffer,
+        created_at: now,
+      });
 
-      const docRes = await dbQuery(
-        `INSERT INTO private_documents (post_id, uploader_id, file_id, file_name, mime_type, size_bytes)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING id, post_id, uploader_id, file_id, file_name, mime_type, size_bytes, created_at`,
-        [id, userId, fileId, safeName, file.mimetype, buffer.length]
-      );
+      const docRecord = {
+        id: newId(),
+        post_id: id,
+        uploader_id: userId,
+        file_id: fileId,
+        file_name: safeName,
+        mime_type: file.mimetype,
+        size_bytes: buffer.length,
+        created_at: now,
+      };
+      await db.collection('private_documents').insertOne({ ...docRecord });
 
-      return reply.status(201).send({ document: docRes.rows[0] });
+      return reply.status(201).send({ document: docRecord });
     }
   );
 }

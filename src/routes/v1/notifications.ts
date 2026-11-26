@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { dbQuery } from '../../lib/db.js';
+import { getDb } from '../../lib/mongo.js';
 import { authenticate } from '../../middleware/auth.js';
 
 export async function notificationRoutes(app: FastifyInstance): Promise<void> {
@@ -14,12 +14,15 @@ export async function notificationRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const res = await dbQuery<{ is_read: boolean }>(
-        'SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
-        [userId]
-      );
-      const unreadCount = res.rows.filter((n) => !n.is_read).length;
-      return { notifications: res.rows, unread_count: unreadCount };
+      const db = await getDb();
+      const notifications = await db
+        .collection('notifications')
+        .find({ user_id: userId }, { projection: { _id: 0 } })
+        .sort({ created_at: -1 })
+        .limit(50)
+        .toArray();
+      const unreadCount = notifications.filter((n) => !n.is_read).length;
+      return { notifications, unread_count: unreadCount };
     }
   );
 
@@ -35,7 +38,8 @@ export async function notificationRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
-      await dbQuery('UPDATE notifications SET is_read = TRUE WHERE id = $1 AND user_id = $2', [id, userId]);
+      const db = await getDb();
+      await db.collection('notifications').updateOne({ id, user_id: userId }, { $set: { is_read: true } });
       return { success: true };
     }
   );
@@ -51,7 +55,8 @@ export async function notificationRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      await dbQuery('UPDATE notifications SET is_read = TRUE WHERE user_id = $1 AND is_read = FALSE', [userId]);
+      const db = await getDb();
+      await db.collection('notifications').updateMany({ user_id: userId, is_read: false }, { $set: { is_read: true } });
       return { success: true };
     }
   );

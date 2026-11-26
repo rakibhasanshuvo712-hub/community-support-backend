@@ -8,7 +8,7 @@ import {
 } from '../../integrations/applink/config.js';
 import { requestOtp, unregisterSubscriber, verifyOtp } from '../../integrations/applink/services.js';
 import { ApplinkError } from '../../integrations/applink/statusCodes.js';
-import { dbQuery, getPool } from '../../lib/db.js';
+import { getDb, newId } from '../../lib/mongo.js';
 import { AppError } from '../../lib/errors.js';
 import { authenticate, requireAdmin } from '../../middleware/auth.js';
 import { processPendingSmsOutbox } from '../../services/applinkSms.service.js';
@@ -64,8 +64,11 @@ const TERMINAL_DELIVERY_STATUSES = new Set([
   'REJECTED',
 ]);
 
+function isDuplicateKeyError(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && 'code' in err && (err as { code?: number }).code === 11000;
+}
+
 export async function applinkRoutes(app: FastifyInstance): Promise<void> {
-  // Authenticated status + user binding info
   app.get(
     '/status',
     {
@@ -80,19 +83,21 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
       const smsMode = getApplinkTransportMode(cfg.urls.smsSend);
       const otpMode = getApplinkTransportMode(cfg.urls.otpRequest);
 
-      const bindRes = await dbQuery<{
-        normalized_msisdn: string;
-        subscription_status: string;
-        binding_mode: string;
-        consented_at: string;
-        last_confirmed_at: string | null;
-      }>(
-        `SELECT normalized_msisdn, subscription_status, binding_mode, consented_at, last_confirmed_at
-         FROM applink_subscriber_bindings WHERE user_id = $1`,
-        [request.authUser!.id]
+      const db = await getDb();
+      const binding = await db.collection('applink_subscriber_bindings').findOne(
+        { user_id: request.authUser!.id },
+        {
+          projection: {
+            _id: 0,
+            normalized_msisdn: 1,
+            subscription_status: 1,
+            binding_mode: 1,
+            consented_at: 1,
+            last_confirmed_at: 1,
+          },
+        }
       );
 
-      const binding = bindRes.rows[0];
       return {
         features_enabled: cfg.featuresEnabled,
         otp_enabled: cfg.otpEnabled,
@@ -101,7 +106,7 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
         otp_transport_mode: otpMode,
         binding: binding
           ? {
-              masked_msisdn: maskTelAddress(binding.normalized_msisdn),
+              masked_msisdn: maskTelAddress(String(binding.normalized_msisdn)),
               subscription_status: binding.subscription_status,
               binding_mode: binding.binding_mode,
               consented_at: binding.consented_at,
@@ -112,7 +117,6 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  // User's SMS notification outbox history (or admin all)
   app.get(
     '/outbox',
     {
@@ -124,22 +128,64 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const isAdmin = request.authUser!.role === 'admin';
-      const res = isAdmin
-        ? await dbQuery(
-            `SELECT id, business_event_key, recipient_user_id, claim_id, transport_mode, status, attempts, provider_request_id, provider_status_code, delivery_status, last_error, created_at, updated_at
-             FROM applink_sms_outbox ORDER BY created_at DESC LIMIT 50`
-          )
-        : await dbQuery(
-            `SELECT id, business_event_key, claim_id, transport_mode, status, attempts, provider_request_id, provider_status_code, delivery_status, created_at, updated_at
-             FROM applink_sms_outbox WHERE recipient_user_id = $1 ORDER BY created_at DESC LIMIT 20`,
-            [request.authUser!.id]
-          );
+      const db = await getDb();
 
-      return { outbox: res.rows };
+      const outbox = isAdmin
+        ? await db
+            .collection('applink_sms_outbox')
+            .find(
+              {},
+              {
+                projection: {
+                  _id: 0,
+                  id: 1,
+                  business_event_key: 1,
+                  recipient_user_id: 1,
+                  claim_id: 1,
+                  transport_mode: 1,
+                  status: 1,
+                  attempts: 1,
+                  provider_request_id: 1,
+                  provider_status_code: 1,
+                  delivery_status: 1,
+                  last_error: 1,
+                  created_at: 1,
+                  updated_at: 1,
+                },
+              }
+            )
+            .sort({ created_at: -1 })
+            .limit(50)
+            .toArray()
+        : await db
+            .collection('applink_sms_outbox')
+            .find(
+              { recipient_user_id: request.authUser!.id },
+              {
+                projection: {
+                  _id: 0,
+                  id: 1,
+                  business_event_key: 1,
+                  claim_id: 1,
+                  transport_mode: 1,
+                  status: 1,
+                  attempts: 1,
+                  provider_request_id: 1,
+                  provider_status_code: 1,
+                  delivery_status: 1,
+                  created_at: 1,
+                  updated_at: 1,
+                },
+              }
+            )
+            .sort({ created_at: -1 })
+            .limit(20)
+            .toArray();
+
+      return { outbox };
     }
   );
 
-  // Admin-triggered bounded retry processor
   app.post(
     '/outbox/process',
     {
@@ -154,7 +200,6 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  // Priority 5: SMS Delivery Status Report Callback
   app.post(
     '/sms/report',
     {
@@ -178,26 +223,33 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
       const { destinationAddress, timeStamp, requestId, deliveryStatus } = parsed.data;
       const normalizedStatus = DLR_STATUS_MAP[deliveryStatus.trim().toUpperCase()] ?? 'UNKNOWN';
       const dedupeKey = `${requestId}:${normalizedStatus}`;
+      const db = await getDb();
 
-      const insertRes = await dbQuery<{ id: string }>(
-        `INSERT INTO applink_delivery_reports (
-          request_id, destination_address, delivery_status, raw_delivery_status, event_timestamp, dedupe_key
-        ) VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (dedupe_key) DO NOTHING
-        RETURNING id`,
-        [requestId, maskTelAddress(destinationAddress), normalizedStatus, deliveryStatus, timeStamp, dedupeKey]
-      );
+      let inserted = false;
+      try {
+        await db.collection('applink_delivery_reports').insertOne({
+          id: newId(),
+          request_id: requestId,
+          destination_address: maskTelAddress(destinationAddress),
+          delivery_status: normalizedStatus,
+          raw_delivery_status: deliveryStatus,
+          event_timestamp: timeStamp,
+          dedupe_key: dedupeKey,
+          created_at: new Date().toISOString(),
+        });
+        inserted = true;
+      } catch (err) {
+        if (!isDuplicateKeyError(err)) throw err;
+      }
 
-      if (insertRes.rows.length > 0) {
-        // Correlate to outbox by provider_request_id and handle out-of-order reports
-        const outboxRes = await dbQuery<{ id: string; status: string; delivery_status: string | null }>(
-          `SELECT id, status, delivery_status FROM applink_sms_outbox WHERE provider_request_id = $1`,
-          [requestId]
+      if (inserted) {
+        const outbox = await db.collection('applink_sms_outbox').findOne(
+          { provider_request_id: requestId },
+          { projection: { _id: 0, id: 1, status: 1, delivery_status: 1 } }
         );
-        const outbox = outboxRes.rows[0];
         if (outbox) {
           const alreadyTerminal =
-            outbox.delivery_status && TERMINAL_DELIVERY_STATUSES.has(outbox.delivery_status);
+            outbox.delivery_status && TERMINAL_DELIVERY_STATUSES.has(String(outbox.delivery_status));
 
           if (!alreadyTerminal || TERMINAL_DELIVERY_STATUSES.has(normalizedStatus)) {
             const nextOutboxStatus =
@@ -207,13 +259,15 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
                   ? 'failed'
                   : outbox.status;
 
-            await dbQuery(
-              `UPDATE applink_sms_outbox
-               SET delivery_status = $1,
-                   status = $2,
-                   updated_at = NOW()
-               WHERE id = $3`,
-              [normalizedStatus, nextOutboxStatus, outbox.id]
+            await db.collection('applink_sms_outbox').updateOne(
+              { id: outbox.id },
+              {
+                $set: {
+                  delivery_status: normalizedStatus,
+                  status: nextOutboxStatus,
+                  updated_at: new Date().toISOString(),
+                },
+              }
             );
           }
         }
@@ -223,7 +277,6 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  // Subscription Notification Callback (keeps local subscription mirror accurate)
   app.post(
     '/subscription/notify',
     {
@@ -251,23 +304,28 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(200).send(CALLBACK_ACK);
       }
 
+      const db = await getDb();
       const dedupeKey = `${data.subscriberId}:${data.status}:${data.timeStamp}`;
-      const inserted = await dbQuery(
-        `INSERT INTO applink_subscription_events (subscriber_id, status, event_timestamp, dedupe_key)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (dedupe_key) DO NOTHING
-         RETURNING id`,
-        [data.subscriberId, data.status, data.timeStamp, dedupeKey]
-      );
+      let inserted = false;
+      try {
+        await db.collection('applink_subscription_events').insertOne({
+          id: newId(),
+          subscriber_id: data.subscriberId,
+          status: data.status,
+          event_timestamp: data.timeStamp,
+          dedupe_key: dedupeKey,
+          created_at: new Date().toISOString(),
+        });
+        inserted = true;
+      } catch (err) {
+        if (!isDuplicateKeyError(err)) throw err;
+      }
 
-      if (inserted.rows.length > 0) {
-        await dbQuery(
-          `UPDATE applink_subscriber_bindings
-           SET subscription_status = $1,
-               last_confirmed_at = NOW(),
-               updated_at = NOW()
-           WHERE subscriber_id = $2`,
-          [data.status, data.subscriberId]
+      if (inserted) {
+        const now = new Date().toISOString();
+        await db.collection('applink_subscriber_bindings').updateMany(
+          { subscriber_id: data.subscriberId },
+          { $set: { subscription_status: data.status, last_confirmed_at: now, updated_at: now } }
         );
       }
 
@@ -275,7 +333,6 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  // Priority 6: Optional OTP Subscriber Binding Flow
   app.post(
     '/binding/otp/request',
     {
@@ -310,21 +367,25 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const userId = request.authUser!.id;
+      const db = await getDb();
+      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
 
-      // Enforce per-user cooldown (60s) & hourly limit (5) across serverless instances
-      const recentRes = await dbQuery<{ count: string; last_created: string | null }>(
-        `SELECT COUNT(*)::text AS count, MAX(created_at)::text AS last_created
-         FROM applink_otp_challenges
-         WHERE (user_id = $1 OR normalized_msisdn = $2)
-           AND created_at > NOW() - INTERVAL '1 hour'`,
-        [userId, normalizedMsisdn]
-      );
+      const recentChallenges = await db
+        .collection('applink_otp_challenges')
+        .find(
+          {
+            $or: [{ user_id: userId }, { normalized_msisdn: normalizedMsisdn }],
+            created_at: { $gt: oneHourAgo },
+          },
+          { projection: { _id: 0, created_at: 1 } }
+        )
+        .sort({ created_at: -1 })
+        .toArray();
 
-      const recentCount = Number(recentRes.rows[0]?.count ?? 0);
-      const lastCreated = recentRes.rows[0]?.last_created;
-      if (recentCount >= 5) {
+      if (recentChallenges.length >= 5) {
         throw new AppError(429, 'RATE_LIMITED', 'Hourly OTP request limit reached. Please try again later.');
       }
+      const lastCreated = recentChallenges[0]?.created_at as string | undefined;
       if (lastCreated && Date.now() - new Date(lastCreated).getTime() < 60_000) {
         throw new AppError(429, 'RATE_LIMITED', 'Please wait 60 seconds before requesting another OTP.');
       }
@@ -346,19 +407,26 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(502, 'INTERNAL_ERROR', 'Applink did not return an OTP referenceNo');
       }
 
-      // Expire any previous pending challenges for this user
-      await dbQuery(
-        `UPDATE applink_otp_challenges SET status = 'expired' WHERE user_id = $1 AND status = 'pending'`,
-        [userId]
-      );
+      await db
+        .collection('applink_otp_challenges')
+        .updateMany({ user_id: userId, status: 'pending' }, { $set: { status: 'expired' } });
 
+      const now = new Date().toISOString();
       const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-      await dbQuery(
-        `INSERT INTO applink_otp_challenges (
-          user_id, normalized_msisdn, provider_mode, reference_no, consent_wording, status, expires_at
-        ) VALUES ($1, $2, $3, $4, $5, 'pending', $6)`,
-        [userId, normalizedMsisdn, providerMode, String(otpResp.referenceNo), body.consent_wording, expiresAt]
-      );
+      await db.collection('applink_otp_challenges').insertOne({
+        id: newId(),
+        user_id: userId,
+        normalized_msisdn: normalizedMsisdn,
+        provider_mode: providerMode,
+        reference_no: String(otpResp.referenceNo),
+        consent_wording: body.consent_wording,
+        status: 'pending',
+        attempts: 0,
+        max_attempts: 5,
+        expires_at: expiresAt,
+        verified_at: null,
+        created_at: now,
+      });
 
       return reply.status(201).send({
         status: providerMode === 'mock' ? 'simulated' : 'sent',
@@ -391,57 +459,36 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(503, 'SERVICE_UNAVAILABLE', 'Applink OTP verify endpoint is disabled');
       }
 
-      const client = await getPool().connect();
-      let challenge: {
-        id: string;
-        normalized_msisdn: string;
-        provider_mode: 'mock' | 'live';
-        reference_no: string;
-        consent_wording: string;
-        attempts: number;
-        max_attempts: number;
-        expires_at: string;
-      };
+      const db = await getDb();
+      const row = await db.collection('applink_otp_challenges').findOne(
+        { user_id: userId, status: 'pending', provider_mode: providerMode },
+        { sort: { created_at: -1 }, projection: { _id: 0 } }
+      );
 
-      try {
-        await client.query('BEGIN');
-        const chRes = await client.query<typeof challenge>(
-          `SELECT id, normalized_msisdn, provider_mode, reference_no, consent_wording, attempts, max_attempts, expires_at
-           FROM applink_otp_challenges
-           WHERE user_id = $1 AND status = 'pending' AND provider_mode = $2
-           ORDER BY created_at DESC
-           LIMIT 1
-           FOR UPDATE`,
-          [userId, providerMode]
-        );
-        const row = chRes.rows[0];
-        if (!row) {
-          throw new AppError(400, 'BAD_REQUEST', 'No pending OTP challenge found. Please request a new OTP.');
-        }
-        if (new Date(row.expires_at).getTime() <= Date.now()) {
-          await client.query(`UPDATE applink_otp_challenges SET status = 'expired' WHERE id = $1`, [row.id]);
-          await client.query('COMMIT');
-          throw new AppError(400, 'BAD_REQUEST', 'OTP has expired. Please request a new OTP.');
-        }
-        if (row.attempts >= row.max_attempts) {
-          await client.query(`UPDATE applink_otp_challenges SET status = 'locked' WHERE id = $1`, [row.id]);
-          await client.query('COMMIT');
-          throw new AppError(429, 'RATE_LIMITED', 'Too many failed OTP attempts. Please request a new OTP.');
-        }
+      if (!row) {
+        throw new AppError(400, 'BAD_REQUEST', 'No pending OTP challenge found. Please request a new OTP.');
+      }
+      if (new Date(String(row.expires_at)).getTime() <= Date.now()) {
+        await db.collection('applink_otp_challenges').updateOne({ id: row.id }, { $set: { status: 'expired' } });
+        throw new AppError(400, 'BAD_REQUEST', 'OTP has expired. Please request a new OTP.');
+      }
+      if (Number(row.attempts) >= Number(row.max_attempts)) {
+        await db.collection('applink_otp_challenges').updateOne({ id: row.id }, { $set: { status: 'locked' } });
+        throw new AppError(429, 'RATE_LIMITED', 'Too many failed OTP attempts. Please request a new OTP.');
+      }
 
-        await client.query(`UPDATE applink_otp_challenges SET attempts = attempts + 1 WHERE id = $1`, [row.id]);
-        challenge = row;
-        await client.query('COMMIT');
-      } catch (err) {
-        await client.query('ROLLBACK').catch(() => undefined);
-        throw err;
-      } finally {
-        client.release();
+      const lockedAttempt = await db.collection('applink_otp_challenges').findOneAndUpdate(
+        { id: row.id, status: 'pending', attempts: { $lt: Number(row.max_attempts) } },
+        { $inc: { attempts: 1 } },
+        { returnDocument: 'after', projection: { _id: 0 } }
+      );
+      if (!lockedAttempt) {
+        throw new AppError(400, 'BAD_REQUEST', 'No pending OTP challenge found. Please request a new OTP.');
       }
 
       let verifyResp;
       try {
-        verifyResp = await verifyOtp(challenge.reference_no, body.otp);
+        verifyResp = await verifyOtp(String(lockedAttempt.reference_no), body.otp);
       } catch (err) {
         if (err instanceof ApplinkError) {
           throw new AppError(400, 'BAD_REQUEST', `OTP verification failed (${err.statusCode}): ${err.statusDetail}`);
@@ -449,45 +496,46 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
         throw err;
       }
 
-      const subscriberId = String(verifyResp.subscriberId || challenge.normalized_msisdn);
+      const subscriberId = String(verifyResp.subscriberId || lockedAttempt.normalized_msisdn);
       const subscriptionStatus = String(verifyResp.subscriptionStatus || 'REGISTERED');
       const now = new Date().toISOString();
 
-      await dbQuery(
-        `UPDATE applink_otp_challenges SET status = 'verified', verified_at = $1 WHERE id = $2 AND status = 'pending'`,
-        [now, challenge.id]
+      const verifiedChallenge = await db.collection('applink_otp_challenges').findOneAndUpdate(
+        { id: lockedAttempt.id, status: 'pending' },
+        { $set: { status: 'verified', verified_at: now } },
+        { returnDocument: 'after', projection: { _id: 0 } }
       );
+      if (!verifiedChallenge) {
+        throw new AppError(409, 'CONFLICT', 'OTP challenge was already used or expired.');
+      }
 
-      await dbQuery(
-        `INSERT INTO applink_subscriber_bindings (
-          user_id, normalized_msisdn, subscriber_id, subscription_status, binding_mode,
-          consent_wording, consent_channel, consented_at, last_confirmed_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, 'web_otp', $7, $7, $7)
-        ON CONFLICT (user_id) DO UPDATE SET
-          normalized_msisdn = EXCLUDED.normalized_msisdn,
-          subscriber_id = EXCLUDED.subscriber_id,
-          subscription_status = EXCLUDED.subscription_status,
-          binding_mode = EXCLUDED.binding_mode,
-          consent_wording = EXCLUDED.consent_wording,
-          consent_channel = EXCLUDED.consent_channel,
-          consented_at = EXCLUDED.consented_at,
-          last_confirmed_at = EXCLUDED.last_confirmed_at,
-          updated_at = NOW()`,
-        [
-          userId,
-          challenge.normalized_msisdn,
-          subscriberId,
-          subscriptionStatus,
-          challenge.provider_mode,
-          challenge.consent_wording,
-          now,
-        ]
+      await db.collection('applink_subscriber_bindings').updateOne(
+        { user_id: userId },
+        {
+          $set: {
+            user_id: userId,
+            normalized_msisdn: lockedAttempt.normalized_msisdn,
+            subscriber_id: subscriberId,
+            subscription_status: subscriptionStatus,
+            binding_mode: lockedAttempt.provider_mode,
+            consent_wording: lockedAttempt.consent_wording,
+            consent_channel: 'web_otp',
+            consented_at: now,
+            last_confirmed_at: now,
+            updated_at: now,
+          },
+          $setOnInsert: {
+            id: newId(),
+            created_at: now,
+          },
+        },
+        { upsert: true }
       );
 
       return {
         verified: true,
-        demo_mode: challenge.provider_mode === 'mock',
-        masked_msisdn: maskTelAddress(challenge.normalized_msisdn),
+        demo_mode: lockedAttempt.provider_mode === 'mock',
+        masked_msisdn: maskTelAddress(String(lockedAttempt.normalized_msisdn)),
         subscription_status: subscriptionStatus,
       };
     }
@@ -505,12 +553,12 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const userId = request.authUser!.id;
       const cfg = getApplinkConfig();
+      const db = await getDb();
 
-      const bindRes = await dbQuery<{ subscriber_id: string; binding_mode: string }>(
-        'SELECT subscriber_id, binding_mode FROM applink_subscriber_bindings WHERE user_id = $1',
-        [userId]
+      const binding = await db.collection('applink_subscriber_bindings').findOne(
+        { user_id: userId },
+        { projection: { _id: 0, subscriber_id: 1, binding_mode: 1 } }
       );
-      const binding = bindRes.rows[0];
       if (!binding) {
         return { success: true, subscription_status: 'UNREGISTERED' };
       }
@@ -519,25 +567,29 @@ export async function applinkRoutes(app: FastifyInstance): Promise<void> {
         const subMode = getApplinkTransportMode(cfg.urls.subscriptionSend);
         if (subMode === binding.binding_mode) {
           try {
-            await unregisterSubscriber(binding.subscriber_id);
+            await unregisterSubscriber(String(binding.subscriber_id));
           } catch (err) {
             request.log.warn({ err }, 'Applink unregister call failed during opt-out; updating local mirror');
           }
         }
       }
 
+      const now = new Date().toISOString();
       await Promise.all([
-        dbQuery(
-          `UPDATE applink_subscriber_bindings
-           SET subscription_status = 'UNREGISTERED', last_confirmed_at = NOW(), updated_at = NOW()
-           WHERE user_id = $1`,
-          [userId]
+        db.collection('applink_subscriber_bindings').updateOne(
+          { user_id: userId },
+          { $set: { subscription_status: 'UNREGISTERED', last_confirmed_at: now, updated_at: now } }
         ),
-        dbQuery(
-          `UPDATE applink_sms_outbox
-           SET status = 'failed', last_error = 'Cancelled due to user opt-out', next_retry_at = NULL, updated_at = NOW()
-           WHERE recipient_user_id = $1 AND status = 'queued'`,
-          [userId]
+        db.collection('applink_sms_outbox').updateMany(
+          { recipient_user_id: userId, status: 'queued' },
+          {
+            $set: {
+              status: 'failed',
+              last_error: 'Cancelled due to user opt-out',
+              next_retry_at: null,
+              updated_at: now,
+            },
+          }
         ),
       ]);
 

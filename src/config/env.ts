@@ -12,7 +12,7 @@ const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(4000),
   HOST: z.string().default('0.0.0.0'),
-  DATABASE_URL: z.string().default(''),
+  MONGODB_URI: z.string().default(''),
   JWT_SECRET: z.string().default('dev-insecure-jwt-secret-change-in-production'),
   ADMIN_EMAIL: z.string().default(''),
   ADMIN_PASSWORD: z.string().default(''),
@@ -48,8 +48,8 @@ export const env = {
 
 export function isDatabaseConfigured(): boolean {
   return Boolean(
-    env.DATABASE_URL &&
-      !env.DATABASE_URL.includes('ep-example') &&
-      env.DATABASE_URL.startsWith('postgres')
+    env.MONGODB_URI &&
+      !env.MONGODB_URI.includes('user:password@host1') &&
+      (env.MONGODB_URI.startsWith('mongodb://') || env.MONGODB_URI.startsWith('mongodb+srv://'))
   );
 }

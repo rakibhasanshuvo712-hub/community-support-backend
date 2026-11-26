@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
-import { dbQuery } from '../../lib/db.js';
+import type { Binary } from 'mongodb';
 import { AppError } from '../../lib/errors.js';
+import { getDb } from '../../lib/mongo.js';
 import { verifyFileToken } from '../../middleware/auth.js';
 
 export async function fileRoutes(app: FastifyInstance): Promise<void> {
@@ -16,14 +17,8 @@ export async function fileRoutes(app: FastifyInstance): Promise<void> {
       const { id } = request.params;
       const { token } = request.query;
 
-      const res = await dbQuery<{
-        bucket: string;
-        file_name: string;
-        mime_type: string;
-        data: Buffer;
-      }>('SELECT bucket, file_name, mime_type, data FROM file_blobs WHERE id = $1', [id]);
-
-      const file = res.rows[0];
+      const db = await getDb();
+      const file = await db.collection('file_blobs').findOne({ id });
       if (!file) {
         throw new AppError(404, 'NOT_FOUND', 'File not found');
       }
@@ -34,11 +29,17 @@ export async function fileRoutes(app: FastifyInstance): Promise<void> {
         }
       }
 
+      const raw = file.data as Binary | Buffer;
+      const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw.buffer);
+
       return reply
-        .header('Content-Type', file.mime_type)
-        .header('Content-Disposition', `inline; filename="${file.file_name}"`)
-        .header('Cache-Control', file.bucket === 'private-documents' ? 'private, max-age=300' : 'public, max-age=3600')
-        .send(file.data);
+        .header('Content-Type', String(file.mime_type))
+        .header('Content-Disposition', `inline; filename="${String(file.file_name)}"`)
+        .header(
+          'Cache-Control',
+          file.bucket === 'private-documents' ? 'private, max-age=300' : 'public, max-age=3600'
+        )
+        .send(buf);
     }
   );
 }

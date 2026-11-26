@@ -6,13 +6,34 @@ import { sendSms } from '../src/integrations/applink/services.js';
 import { env } from '../src/config/env.js';
 import { buildApp } from '../src/app.js';
 
-vi.mock('../src/lib/db.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../src/lib/db.js')>();
+vi.mock('../src/lib/mongo.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/lib/mongo.js')>();
+  const mockCursor = () => ({
+    sort: () => mockCursor(),
+    limit: () => mockCursor(),
+    skip: () => mockCursor(),
+    toArray: vi.fn().mockResolvedValue([]),
+  });
+  const mockCollection = () => ({
+    find: () => mockCursor(),
+    findOne: vi.fn().mockResolvedValue(null),
+    findOneAndUpdate: vi.fn().mockResolvedValue(null),
+    insertOne: vi.fn().mockResolvedValue({ acknowledged: true }),
+    insertMany: vi.fn().mockResolvedValue({ acknowledged: true }),
+    updateOne: vi.fn().mockResolvedValue({ acknowledged: true }),
+    updateMany: vi.fn().mockResolvedValue({ acknowledged: true }),
+    deleteOne: vi.fn().mockResolvedValue({ acknowledged: true }),
+    deleteMany: vi.fn().mockResolvedValue({ acknowledged: true }),
+    countDocuments: vi.fn().mockResolvedValue(0),
+    createIndex: vi.fn().mockResolvedValue('ok'),
+  });
+  const mockDb = {
+    collection: vi.fn().mockImplementation(() => mockCollection()),
+    command: vi.fn().mockResolvedValue({ ok: 1 }),
+  };
   return {
     ...actual,
-    dbQuery: vi.fn().mockResolvedValue({ rows: [] }),
-    getPool: vi.fn(),
-    ensureSchemaMigrated: vi.fn().mockResolvedValue(undefined),
+    getDb: vi.fn().mockResolvedValue(mockDb),
   };
 });
 

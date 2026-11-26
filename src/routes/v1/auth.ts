@@ -1,11 +1,16 @@
 import bcrypt from 'bcryptjs';
 import type { FastifyInstance } from 'fastify';
 import { isDatabaseConfigured } from '../../config/env.js';
-import { dbQuery, getPool } from '../../lib/db.js';
 import { AppError } from '../../lib/errors.js';
+import { getDb, newId } from '../../lib/mongo.js';
 import { sanitizeText } from '../../lib/security.js';
 import { authenticate, signAuthToken } from '../../middleware/auth.js';
-import { loginSchema, registerSchema, resetPasswordSchema } from '../../schemas/auth.schema.js';
+import {
+  loginSchema,
+  normalizeBdPhone,
+  registerSchema,
+  resetPasswordSchema,
+} from '../../schemas/auth.schema.js';
 
 export async function authRoutes(app: FastifyInstance): Promise<void> {
   app.post(
@@ -13,7 +18,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     {
       schema: {
         tags: ['Auth'],
-        summary: 'Register a new user account',
+        summary: 'Register a new user account with a Bangladeshi phone number',
       },
     },
     async (request, reply) => {
@@ -22,48 +27,66 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(503, 'SERVICE_UNAVAILABLE', 'Database is not configured yet');
       }
 
-      const email = body.email.toLowerCase();
+      const normalizedPhone = normalizeBdPhone(body.phone);
+      if (!normalizedPhone) {
+        throw new AppError(400, 'VALIDATION_ERROR', 'Invalid Bangladeshi phone number');
+      }
+
+      const email = body.email ? body.email.toLowerCase().trim() : null;
       const fullName = sanitizeText(body.full_name);
       const passwordHash = await bcrypt.hash(body.password, 10);
 
-      const existing = await dbQuery('SELECT id FROM users WHERE email = $1', [email]);
-      if (existing.rows.length > 0) {
-        throw new AppError(409, 'CONFLICT', 'An account with this email already exists');
+      const db = await getDb();
+      const existingPhone = await db.collection('users').findOne({ phone: normalizedPhone });
+      if (existingPhone) {
+        throw new AppError(409, 'CONFLICT', 'An account with this phone number already exists');
+      }
+      if (email) {
+        const existingEmail = await db.collection('users').findOne({ email });
+        if (existingEmail) {
+          throw new AppError(409, 'CONFLICT', 'An account with this email already exists');
+        }
       }
 
-      const client = await getPool().connect();
-      let userId: string;
-      try {
-        await client.query('BEGIN');
-        const userRes = await client.query<{ id: string }>(
-          'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id',
-          [email, passwordHash]
-        );
-        userId = userRes.rows[0]!.id;
+      const userId = newId();
+      const now = new Date().toISOString();
 
-        await client.query(
-          `INSERT INTO profiles (id, full_name, preferred_language)
-           VALUES ($1, $2, $3)`,
-          [userId, fullName, body.preferred_language]
-        );
+      await Promise.all([
+        db.collection('users').insertOne({
+          id: userId,
+          phone: normalizedPhone,
+          email: email ?? null,
+          password_hash: passwordHash,
+          created_at: now,
+        }),
+        db.collection('profiles').insertOne({
+          id: userId,
+          full_name: fullName,
+          avatar_file_id: null,
+          bio: null,
+          role: 'user',
+          is_suspended: false,
+          suspended_reason: null,
+          preferred_language: body.preferred_language,
+          location_city: null,
+          location_area: null,
+          created_at: now,
+          updated_at: now,
+        }),
+        db.collection('profile_contacts').insertOne({
+          user_id: userId,
+          email: email ?? null,
+          phone: `+${normalizedPhone}`,
+          exact_address: null,
+          updated_at: now,
+        }),
+      ]);
 
-        await client.query(
-          `INSERT INTO profile_contacts (user_id, email)
-           VALUES ($1, $2)`,
-          [userId, email]
-        );
-        await client.query('COMMIT');
-      } catch (err) {
-        await client.query('ROLLBACK');
-        throw err;
-      } finally {
-        client.release();
-      }
-
-      const token = signAuthToken(userId, email);
+      const token = signAuthToken(userId, email ?? '', normalizedPhone);
       return reply.status(201).send({
         user: {
           id: userId,
+          phone: `+${normalizedPhone}`,
           email,
           full_name: fullName,
           role: 'user',
@@ -83,7 +106,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     {
       schema: {
         tags: ['Auth'],
-        summary: 'Sign in with email and password',
+        summary: 'Sign in with Bangladeshi phone number (or email) and password',
       },
     },
     async (request) => {
@@ -92,46 +115,46 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(503, 'SERVICE_UNAVAILABLE', 'Database is not configured yet');
       }
 
-      const email = body.email.toLowerCase();
-      const userRes = await dbQuery<{
-        id: string;
-        email: string;
-        password_hash: string;
-        full_name: string;
-        role: string;
-        is_suspended: boolean;
-        preferred_language: string;
-      }>(
-        `SELECT u.id, u.email, u.password_hash, p.full_name, p.role, p.is_suspended, p.preferred_language
-         FROM users u
-         JOIN profiles p ON p.id = u.id
-         WHERE u.email = $1`,
-        [email]
-      );
+      const rawIdent = (body.identifier || body.phone || body.email || '').trim();
+      const normalizedPhone = normalizeBdPhone(rawIdent);
 
-      const user = userRes.rows[0];
+      const db = await getDb();
+      const user = normalizedPhone
+        ? await db.collection('users').findOne({ phone: normalizedPhone })
+        : await db.collection('users').findOne({ email: rawIdent.toLowerCase() });
+
       if (!user) {
-        throw new AppError(401, 'UNAUTHORIZED', 'Invalid email or password');
+        throw new AppError(401, 'UNAUTHORIZED', 'Invalid phone number/email or password');
       }
 
-      const valid = await bcrypt.compare(body.password, user.password_hash);
+      const valid = await bcrypt.compare(body.password, String(user.password_hash));
       if (!valid) {
-        throw new AppError(401, 'UNAUTHORIZED', 'Invalid email or password');
+        throw new AppError(401, 'UNAUTHORIZED', 'Invalid phone number/email or password');
       }
 
-      if (user.is_suspended) {
+      const profile = await db.collection('profiles').findOne({ id: String(user.id) });
+      if (!profile) {
+        throw new AppError(401, 'UNAUTHORIZED', 'User profile not found');
+      }
+      if (profile.is_suspended) {
         throw new AppError(403, 'FORBIDDEN', 'Your account has been suspended');
       }
 
-      const token = signAuthToken(user.id, user.email);
+      const token = signAuthToken(
+        String(user.id),
+        String(user.email ?? ''),
+        user.phone ? String(user.phone) : null
+      );
+
       return {
         user: {
-          id: user.id,
-          email: user.email,
-          full_name: user.full_name,
-          role: user.role,
-          is_suspended: user.is_suspended,
-          preferred_language: user.preferred_language,
+          id: String(user.id),
+          phone: user.phone ? `+${String(user.phone)}` : null,
+          email: user.email ?? null,
+          full_name: profile.full_name,
+          role: profile.role,
+          is_suspended: profile.is_suspended,
+          preferred_language: profile.preferred_language,
         },
         session: {
           access_token: token,
@@ -165,7 +188,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       resetPasswordSchema.parse(request.body);
       return {
         success: true,
-        message: 'If an account exists for that email, a password reset instruction has been recorded.',
+        message: 'If an account exists, a password reset instruction has been recorded.',
       };
     }
   );
@@ -181,35 +204,26 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const [profRes, contactRes] = await Promise.all([
-        dbQuery(
-          `SELECT id, full_name, avatar_file_id, bio, role, is_suspended, preferred_language, location_city, location_area, created_at
-           FROM profiles WHERE id = $1`,
-          [userId]
-        ),
-        dbQuery(
-          `SELECT email, phone, exact_address FROM profile_contacts WHERE user_id = $1`,
-          [userId]
-        ),
+      const db = await getDb();
+      const [profile, contacts] = await Promise.all([
+        db.collection('profiles').findOne({ id: userId }, { projection: { _id: 0 } }),
+        db.collection('profile_contacts').findOne({ user_id: userId }, { projection: { _id: 0 } }),
       ]);
 
-      const profile = profRes.rows[0] ?? {};
-      const contacts = contactRes.rows[0] ?? {
-        email: request.authUser!.email,
-        phone: null,
-        exact_address: null,
-      };
-
       const baseUrl = `${request.protocol}://${request.headers.host}`;
-      const avatarSignedUrl = profile.avatar_file_id
-        ? `${baseUrl}/api/v1/files/${profile.avatar_file_id}`
+      const avatarSignedUrl = profile?.avatar_file_id
+        ? `${baseUrl}/api/v1/files/${String(profile.avatar_file_id)}`
         : null;
 
       return {
         user: {
           ...profile,
           avatar_signed_url: avatarSignedUrl,
-          contacts,
+          contacts: contacts ?? {
+            email: request.authUser!.email || null,
+            phone: request.authUser!.phone ? `+${request.authUser!.phone}` : null,
+            exact_address: null,
+          },
         },
       };
     }

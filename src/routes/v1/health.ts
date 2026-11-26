@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { isDatabaseConfigured } from '../../config/env.js';
-import { dbQuery } from '../../lib/db.js';
+import { getDb } from '../../lib/mongo.js';
 
 export async function healthRoutes(app: FastifyInstance): Promise<void> {
   app.get(
@@ -8,14 +8,15 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
     {
       schema: {
         tags: ['Health'],
-        summary: 'API & Neon PostgreSQL health check',
+        summary: 'API & MongoDB Atlas health check',
       },
     },
     async () => {
       let dbStatus: 'connected' | 'unconfigured' | 'error' = 'unconfigured';
       if (isDatabaseConfigured()) {
         try {
-          await dbQuery('SELECT 1');
+          const db = await getDb();
+          await db.command({ ping: 1 });
           dbStatus = 'connected';
         } catch {
           dbStatus = 'error';
@@ -26,7 +27,7 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
         status: 'ok',
         service: 'community-support-api',
         version: '1.0.0',
-        provider: 'neon-postgres',
+        provider: 'mongodb',
         timestamp: new Date().toISOString(),
         database: dbStatus,
       };

@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { isDatabaseConfigured } from '../../config/env.js';
-import { dbQuery, DEFAULT_CATEGORIES } from '../../lib/db.js';
+import { DEFAULT_CATEGORIES, getDb } from '../../lib/mongo.js';
 
 export async function categoryRoutes(app: FastifyInstance): Promise<void> {
   app.get(
@@ -15,8 +15,13 @@ export async function categoryRoutes(app: FastifyInstance): Promise<void> {
       if (!isDatabaseConfigured()) {
         return { categories: DEFAULT_CATEGORIES };
       }
-      const res = await dbQuery('SELECT * FROM categories ORDER BY sort_order ASC');
-      return { categories: res.rows };
+      const db = await getDb();
+      const categories = await db
+        .collection('categories')
+        .find({}, { projection: { _id: 0 } })
+        .sort({ sort_order: 1 })
+        .toArray();
+      return { categories };
     }
   );
 }

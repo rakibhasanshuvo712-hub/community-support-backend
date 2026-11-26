@@ -1,12 +1,13 @@
 import type { FastifyRequest } from 'fastify';
 import jwt from 'jsonwebtoken';
 import { env, isDatabaseConfigured } from '../config/env.js';
-import { dbQuery } from '../lib/db.js';
 import { AppError } from '../lib/errors.js';
+import { getDb } from '../lib/mongo.js';
 
 export interface AuthUser {
   id: string;
   email: string;
+  phone?: string | null;
   role: 'user' | 'admin';
   full_name: string;
   is_suspended: boolean;
@@ -15,6 +16,7 @@ export interface AuthUser {
 interface JwtPayload {
   sub: string;
   email: string;
+  phone?: string | null;
 }
 
 declare module 'fastify' {
@@ -24,8 +26,8 @@ declare module 'fastify' {
   }
 }
 
-export function signAuthToken(userId: string, email: string): string {
-  return jwt.sign({ sub: userId, email }, env.JWT_SECRET, { expiresIn: '7d' });
+export function signAuthToken(userId: string, email: string, phone?: string | null): string {
+  return jwt.sign({ sub: userId, email, phone: phone ?? null }, env.JWT_SECRET, { expiresIn: '7d' });
 }
 
 export function signFileToken(fileId: string): string {
@@ -62,14 +64,8 @@ async function resolveUserFromToken(token: string): Promise<AuthUser> {
     throw new AppError(401, 'UNAUTHORIZED', 'Invalid or expired authentication token');
   }
 
-  const res = await dbQuery<{
-    id: string;
-    role: string;
-    full_name: string;
-    is_suspended: boolean;
-  }>('SELECT id, role, full_name, is_suspended FROM profiles WHERE id = $1', [payload.sub]);
-
-  const profile = res.rows[0];
+  const db = await getDb();
+  const profile = await db.collection('profiles').findOne({ id: payload.sub });
   if (!profile) {
     throw new AppError(401, 'UNAUTHORIZED', 'User profile not found');
   }
@@ -78,11 +74,12 @@ async function resolveUserFromToken(token: string): Promise<AuthUser> {
   }
 
   return {
-    id: profile.id,
-    email: payload.email,
+    id: String(profile.id),
+    email: payload.email ?? '',
+    phone: payload.phone ?? null,
     role: profile.role === 'admin' ? 'admin' : 'user',
-    full_name: profile.full_name,
-    is_suspended: profile.is_suspended,
+    full_name: String(profile.full_name || 'Community Member'),
+    is_suspended: Boolean(profile.is_suspended),
   };
 }
 

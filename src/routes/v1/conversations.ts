@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { dbQuery } from '../../lib/db.js';
+import { getDb, newId } from '../../lib/mongo.js';
 import { AppError } from '../../lib/errors.js';
 import { assertNoSensitiveFinancialData, sanitizeText } from '../../lib/security.js';
 import { authenticate } from '../../middleware/auth.js';
@@ -7,11 +7,12 @@ import { createConversationSchema, sendMessageSchema } from '../../schemas/inter
 import { createNotification } from '../../services/notifications.service.js';
 
 async function assertParticipant(conversationId: string, userId: string): Promise<void> {
-  const res = await dbQuery(
-    'SELECT conversation_id FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2',
-    [conversationId, userId]
+  const db = await getDb();
+  const row = await db.collection('conversation_participants').findOne(
+    { conversation_id: conversationId, user_id: userId },
+    { projection: { _id: 1 } }
   );
-  if (res.rows.length === 0) {
+  if (!row) {
     throw new AppError(403, 'FORBIDDEN', 'You are not a participant in this conversation');
   }
 }
@@ -28,25 +29,72 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const res = await dbQuery(
-        `SELECT c.id, c.post_id, c.created_at, c.updated_at,
-                CASE WHEN p.id IS NOT NULL THEN json_build_object('id', p.id, 'title', p.title, 'post_type', p.post_type, 'status', p.status) ELSE NULL END AS post,
-                (SELECT json_agg(json_build_object('user_id', cp2.user_id, 'profile', json_build_object('id', pr.id, 'full_name', pr.full_name)))
-                 FROM conversation_participants cp2
-                 JOIN profiles pr ON pr.id = cp2.user_id
-                 WHERE cp2.conversation_id = c.id) AS participants,
-                (SELECT json_build_object('id', m.id, 'sender_id', m.sender_id, 'content', m.content, 'created_at', m.created_at, 'is_read', m.is_read)
-                 FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) AS last_message,
-                (SELECT COUNT(*)::int FROM messages m WHERE m.conversation_id = c.id AND m.sender_id <> $1 AND m.is_read = FALSE) AS unread_count
-         FROM conversations c
-         JOIN conversation_participants cp ON cp.conversation_id = c.id
-         LEFT JOIN posts p ON p.id = c.post_id
-         WHERE cp.user_id = $1
-         ORDER BY c.updated_at DESC`,
-        [userId]
-      );
+      const db = await getDb();
 
-      return { conversations: res.rows };
+      const myParts = await db
+        .collection('conversation_participants')
+        .find({ user_id: userId }, { projection: { _id: 0, conversation_id: 1 } })
+        .toArray();
+      const convIds = myParts.map((p) => String(p.conversation_id));
+      if (convIds.length === 0) return { conversations: [] };
+
+      const convs = await db
+        .collection('conversations')
+        .find({ id: { $in: convIds } }, { projection: { _id: 0 } })
+        .sort({ updated_at: -1 })
+        .toArray();
+
+      const postIds = [...new Set(convs.map((c) => c.post_id).filter(Boolean).map(String))];
+      const [allParts, posts, allMessages] = await Promise.all([
+        db.collection('conversation_participants').find({ conversation_id: { $in: convIds } }, { projection: { _id: 0 } }).toArray(),
+        postIds.length
+          ? db.collection('posts').find({ id: { $in: postIds } }, { projection: { _id: 0, id: 1, title: 1, post_type: 1, status: 1 } }).toArray()
+          : Promise.resolve([]),
+        db.collection('messages').find({ conversation_id: { $in: convIds } }, { projection: { _id: 0 } }).sort({ created_at: -1 }).toArray(),
+      ]);
+
+      const partUserIds = [...new Set(allParts.map((p) => String(p.user_id)))];
+      const profiles = partUserIds.length
+        ? await db.collection('profiles').find({ id: { $in: partUserIds } }, { projection: { _id: 0, id: 1, full_name: 1 } }).toArray()
+        : [];
+      const profileMap = new Map(profiles.map((p) => [String(p.id), p]));
+      const postMap = new Map(posts.map((p) => [String(p.id), p]));
+
+      const conversations = convs.map((c) => {
+        const parts = allParts
+          .filter((p) => p.conversation_id === c.id)
+          .map((p) => {
+            const pr = profileMap.get(String(p.user_id));
+            return {
+              user_id: p.user_id,
+              profile: pr ? { id: pr.id, full_name: pr.full_name } : null,
+            };
+          });
+        const msgs = allMessages.filter((m) => m.conversation_id === c.id);
+        const lastMsg = msgs[0] ?? null;
+        const unreadCount = msgs.filter((m) => m.sender_id !== userId && !m.is_read).length;
+
+        return {
+          id: c.id,
+          post_id: c.post_id ?? null,
+          created_at: c.created_at,
+          updated_at: c.updated_at,
+          post: c.post_id ? postMap.get(String(c.post_id)) ?? null : null,
+          participants: parts,
+          last_message: lastMsg
+            ? {
+                id: lastMsg.id,
+                sender_id: lastMsg.sender_id,
+                content: lastMsg.content,
+                created_at: lastMsg.created_at,
+                is_read: lastMsg.is_read,
+              }
+            : null,
+          unread_count: unreadCount,
+        };
+      });
+
+      return { conversations };
     }
   );
 
@@ -67,43 +115,62 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
       }
       assertNoSensitiveFinancialData(body.initial_message);
 
-      const recRes = await dbQuery<{ id: string; is_suspended: boolean }>(
-        'SELECT id, is_suspended FROM profiles WHERE id = $1',
-        [body.recipient_id]
+      const db = await getDb();
+      const recipient = await db.collection('profiles').findOne(
+        { id: body.recipient_id },
+        { projection: { _id: 0, id: 1, is_suspended: 1 } }
       );
-      if (!recRes.rows[0] || recRes.rows[0].is_suspended) {
+      if (!recipient || recipient.is_suspended) {
         throw new AppError(404, 'NOT_FOUND', 'Recipient not found');
       }
 
-      const existingRes = await dbQuery<{ id: string }>(
-        `SELECT c.id FROM conversations c
-         JOIN conversation_participants cp1 ON cp1.conversation_id = c.id AND cp1.user_id = $1
-         JOIN conversation_participants cp2 ON cp2.conversation_id = c.id AND cp2.user_id = $2
-         WHERE ($3::uuid IS NULL OR c.post_id = $3::uuid)
-         LIMIT 1`,
-        [userId, body.recipient_id, body.post_id ?? null]
-      );
+      const myParts = await db
+        .collection('conversation_participants')
+        .find({ user_id: userId }, { projection: { _id: 0, conversation_id: 1 } })
+        .toArray();
+      const myConvIds = myParts.map((p) => String(p.conversation_id));
 
-      let conversationId = existingRes.rows[0]?.id;
+      let existingConvId: string | null = null;
+      if (myConvIds.length > 0) {
+        const sharedParts = await db
+          .collection('conversation_participants')
+          .find({ conversation_id: { $in: myConvIds }, user_id: body.recipient_id }, { projection: { _id: 0, conversation_id: 1 } })
+          .toArray();
+        const sharedIds = sharedParts.map((p) => String(p.conversation_id));
+        if (sharedIds.length > 0) {
+          const convFilter: Record<string, unknown> = { id: { $in: sharedIds } };
+          if (body.post_id) convFilter.post_id = body.post_id;
+          const found = await db.collection('conversations').findOne(convFilter, { projection: { _id: 0, id: 1 } });
+          if (found) existingConvId = String(found.id);
+        }
+      }
+
+      const now = new Date().toISOString();
+      let conversationId = existingConvId;
       if (!conversationId) {
-        const created = await dbQuery<{ id: string }>(
-          'INSERT INTO conversations (post_id) VALUES ($1) RETURNING id',
-          [body.post_id ?? null]
-        );
-        conversationId = created.rows[0]!.id;
-        await dbQuery(
-          `INSERT INTO conversation_participants (conversation_id, user_id, last_read_at)
-           VALUES ($1, $2, NOW()), ($1, $3, NULL)`,
-          [conversationId, userId, body.recipient_id]
-        );
+        conversationId = newId();
+        await db.collection('conversations').insertOne({
+          id: conversationId,
+          post_id: body.post_id ?? null,
+          created_at: now,
+          updated_at: now,
+        });
+        await db.collection('conversation_participants').insertMany([
+          { conversation_id: conversationId, user_id: userId, last_read_at: now },
+          { conversation_id: conversationId, user_id: body.recipient_id, last_read_at: null },
+        ]);
       }
 
       if (body.initial_message) {
-        await dbQuery(
-          'INSERT INTO messages (conversation_id, sender_id, content) VALUES ($1, $2, $3)',
-          [conversationId, userId, sanitizeText(body.initial_message)]
-        );
-        await dbQuery('UPDATE conversations SET updated_at = NOW() WHERE id = $1', [conversationId]);
+        await db.collection('messages').insertOne({
+          id: newId(),
+          conversation_id: conversationId,
+          sender_id: userId,
+          content: sanitizeText(body.initial_message),
+          is_read: false,
+          created_at: now,
+        });
+        await db.collection('conversations').updateOne({ id: conversationId }, { $set: { updated_at: now } });
         await createNotification({
           userId: body.recipient_id,
           type: 'new_message',
@@ -113,7 +180,7 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
         });
       }
 
-      return reply.status(existingRes.rows[0] ? 200 : 201).send({ conversation_id: conversationId });
+      return reply.status(existingConvId ? 200 : 201).send({ conversation_id: conversationId });
     }
   );
 
@@ -131,15 +198,18 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
       const userId = request.authUser!.id;
       await assertParticipant(id, userId);
 
-      const res = await dbQuery(
-        'SELECT id, conversation_id, sender_id, content, is_read, created_at FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC',
-        [id]
+      const db = await getDb();
+      const messages = await db
+        .collection('messages')
+        .find({ conversation_id: id }, { projection: { _id: 0, id: 1, conversation_id: 1, sender_id: 1, content: 1, is_read: 1, created_at: 1 } })
+        .sort({ created_at: 1 })
+        .toArray();
+
+      await db.collection('messages').updateMany(
+        { conversation_id: id, sender_id: { $ne: userId }, is_read: false },
+        { $set: { is_read: true } }
       );
-      await dbQuery(
-        'UPDATE messages SET is_read = TRUE WHERE conversation_id = $1 AND sender_id <> $2 AND is_read = FALSE',
-        [id, userId]
-      );
-      return { messages: res.rows };
+      return { messages };
     }
   );
 
@@ -160,19 +230,26 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
       const body = sendMessageSchema.parse(request.body);
       assertNoSensitiveFinancialData(body.content);
 
-      const msgRes = await dbQuery(
-        'INSERT INTO messages (conversation_id, sender_id, content) VALUES ($1, $2, $3) RETURNING *',
-        [id, userId, sanitizeText(body.content)]
-      );
-      await dbQuery('UPDATE conversations SET updated_at = NOW() WHERE id = $1', [id]);
+      const db = await getDb();
+      const now = new Date().toISOString();
+      const msg = {
+        id: newId(),
+        conversation_id: id,
+        sender_id: userId,
+        content: sanitizeText(body.content),
+        is_read: false,
+        created_at: now,
+      };
+      await db.collection('messages').insertOne({ ...msg });
+      await db.collection('conversations').updateOne({ id }, { $set: { updated_at: now } });
 
-      const others = await dbQuery<{ user_id: string }>(
-        'SELECT user_id FROM conversation_participants WHERE conversation_id = $1 AND user_id <> $2',
-        [id, userId]
-      );
-      for (const p of others.rows) {
+      const others = await db
+        .collection('conversation_participants')
+        .find({ conversation_id: id, user_id: { $ne: userId } }, { projection: { _id: 0, user_id: 1 } })
+        .toArray();
+      for (const p of others) {
         await createNotification({
-          userId: p.user_id,
+          userId: String(p.user_id),
           type: 'new_message',
           title: 'New message',
           body: `${request.authUser!.full_name} sent you a message.`,
@@ -180,7 +257,7 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
         });
       }
 
-      return reply.status(201).send({ message: msgRes.rows[0] });
+      return reply.status(201).send({ message: msg });
     }
   );
 
@@ -198,9 +275,10 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
       const userId = request.authUser!.id;
       await assertParticipant(id, userId);
 
-      await dbQuery(
-        'UPDATE messages SET is_read = TRUE WHERE conversation_id = $1 AND sender_id <> $2 AND is_read = FALSE',
-        [id, userId]
+      const db = await getDb();
+      await db.collection('messages').updateMany(
+        { conversation_id: id, sender_id: { $ne: userId }, is_read: false },
+        { $set: { is_read: true } }
       );
       return { success: true };
     }

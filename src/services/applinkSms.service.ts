@@ -1,7 +1,7 @@
 import { getApplinkConfig, getApplinkTransportMode } from '../integrations/applink/config.js';
 import { sendSms } from '../integrations/applink/services.js';
 import { ApplinkError } from '../integrations/applink/statusCodes.js';
-import { dbQuery } from '../lib/db.js';
+import { getDb, newId } from '../lib/mongo.js';
 
 export type SmsOutboxStatus =
   | 'queued'
@@ -39,22 +39,16 @@ export async function enqueueAndDispatchClaimAcceptedSms(params: {
       return { status: 'disabled' };
     }
 
-    const bindingRes = await dbQuery<{
-      subscriber_id: string;
-      subscription_status: string;
-      binding_mode: string;
-    }>(
-      `SELECT subscriber_id, subscription_status, binding_mode
-       FROM applink_subscriber_bindings
-       WHERE user_id = $1`,
-      [params.recipientUserId]
+    const db = await getDb();
+    const binding = await db.collection('applink_subscriber_bindings').findOne(
+      { user_id: params.recipientUserId },
+      { projection: { _id: 0, subscriber_id: 1, subscription_status: 1, binding_mode: 1 } }
     );
 
-    const binding = bindingRes.rows[0];
     if (!binding) {
       return { status: 'no_binding' };
     }
-    if (!['REGISTERED', 'TRIAL'].includes(binding.subscription_status)) {
+    if (!['REGISTERED', 'TRIAL'].includes(String(binding.subscription_status))) {
       return { status: 'not_subscribed' };
     }
     // Mock bindings must NEVER trigger live SMS
@@ -63,29 +57,40 @@ export async function enqueueAndDispatchClaimAcceptedSms(params: {
     }
 
     const eventKey = `claim_accepted:${params.claimId}`;
-    const insertRes = await dbQuery<{ id: string }>(
-      `INSERT INTO applink_sms_outbox (
-        business_event_key, recipient_user_id, claim_id, subscriber_id, transport_mode, message_body, status
-      ) VALUES ($1, $2, $3, $4, $5, $6, 'queued')
-      ON CONFLICT (business_event_key) DO NOTHING
-      RETURNING id`,
-      [
-        eventKey,
-        params.recipientUserId,
-        params.claimId,
-        binding.subscriber_id,
-        transportMode,
-        CLAIM_ACCEPTED_TEMPLATE,
-      ]
-    );
+    const outboxId = newId();
+    const now = new Date().toISOString();
 
-    const row = insertRes.rows[0];
-    if (!row) {
-      return { status: 'duplicate_skipped' };
+    try {
+      await db.collection('applink_sms_outbox').insertOne({
+        id: outboxId,
+        business_event_key: eventKey,
+        recipient_user_id: params.recipientUserId,
+        claim_id: params.claimId,
+        subscriber_id: String(binding.subscriber_id),
+        transport_mode: transportMode,
+        message_body: CLAIM_ACCEPTED_TEMPLATE,
+        status: 'queued',
+        attempts: 0,
+        max_attempts: 3,
+        provider_request_id: null,
+        provider_message_id: null,
+        provider_status_code: null,
+        provider_status_detail: null,
+        delivery_status: null,
+        last_error: null,
+        next_retry_at: null,
+        created_at: now,
+        updated_at: now,
+      });
+    } catch (err: unknown) {
+      if (typeof err === 'object' && err !== null && 'code' in err && (err as { code?: number }).code === 11000) {
+        return { status: 'duplicate_skipped' };
+      }
+      throw err;
     }
 
-    const finalStatus = await dispatchOutboxRow(row.id);
-    return { outboxId: row.id, status: finalStatus };
+    const finalStatus = await dispatchOutboxRow(outboxId);
+    return { outboxId, status: finalStatus };
   } catch (err) {
     console.error('Claim-accepted SMS enqueue/dispatch error:', err instanceof Error ? err.message : err);
     return { status: 'error' };
@@ -94,12 +99,23 @@ export async function enqueueAndDispatchClaimAcceptedSms(params: {
 
 export async function dispatchOutboxRow(outboxId: string): Promise<SmsOutboxStatus> {
   const cfg = getApplinkConfig();
-  const rowRes = await dbQuery<OutboxRow>(
-    `SELECT id, subscriber_id, transport_mode, message_body, status, attempts, max_attempts
-     FROM applink_sms_outbox WHERE id = $1`,
-    [outboxId]
-  );
-  const row = rowRes.rows[0];
+  const db = await getDb();
+  const row = (await db.collection('applink_sms_outbox').findOne(
+    { id: outboxId },
+    {
+      projection: {
+        _id: 0,
+        id: 1,
+        subscriber_id: 1,
+        transport_mode: 1,
+        message_body: 1,
+        status: 1,
+        attempts: 1,
+        max_attempts: 1,
+      },
+    }
+  )) as OutboxRow | null;
+
   if (!row) return 'failed';
   if (!['queued', 'failed'].includes(row.status)) {
     return row.status;
@@ -111,6 +127,7 @@ export async function dispatchOutboxRow(outboxId: string): Promise<SmsOutboxStat
   }
 
   const nextAttempt = row.attempts + 1;
+  const now = new Date().toISOString();
 
   try {
     const resp = await sendSms(row.subscriber_id, row.message_body, {
@@ -120,97 +137,99 @@ export async function dispatchOutboxRow(outboxId: string): Promise<SmsOutboxStat
     const firstDest = Array.isArray(resp.destinationResponses) ? resp.destinationResponses[0] : undefined;
     const nextStatus: SmsOutboxStatus = transportMode === 'mock' ? 'simulated' : 'provider_accepted';
 
-    await dbQuery(
-      `UPDATE applink_sms_outbox
-       SET status = $1,
-           attempts = $2,
-           provider_request_id = $3,
-           provider_message_id = $4,
-           provider_status_code = $5,
-           provider_status_detail = $6,
-           last_error = NULL,
-           next_retry_at = NULL,
-           updated_at = NOW()
-       WHERE id = $7`,
-      [
-        nextStatus,
-        nextAttempt,
-        resp.requestId ?? null,
-        firstDest?.messageId ?? null,
-        resp.statusCode,
-        resp.statusDetail ?? null,
-        row.id,
-      ]
+    await db.collection('applink_sms_outbox').updateOne(
+      { id: row.id },
+      {
+        $set: {
+          status: nextStatus,
+          attempts: nextAttempt,
+          provider_request_id: resp.requestId ?? null,
+          provider_message_id: firstDest?.messageId ?? null,
+          provider_status_code: resp.statusCode,
+          provider_status_detail: resp.statusDetail ?? null,
+          last_error: null,
+          next_retry_at: null,
+          updated_at: now,
+        },
+      }
     );
     return nextStatus;
   } catch (err) {
     if (err instanceof ApplinkError) {
       if (err.isAmbiguousTimeout) {
         // Never blindly resend after an ambiguous timeout
-        await dbQuery(
-          `UPDATE applink_sms_outbox
-           SET status = 'unknown',
-               attempts = $1,
-               provider_status_code = $2,
-               last_error = $3,
-               next_retry_at = NULL,
-               updated_at = NOW()
-           WHERE id = $4`,
-          [nextAttempt, err.statusCode, err.message, row.id]
+        await db.collection('applink_sms_outbox').updateOne(
+          { id: row.id },
+          {
+            $set: {
+              status: 'unknown',
+              attempts: nextAttempt,
+              provider_status_code: err.statusCode,
+              last_error: err.message,
+              next_retry_at: null,
+              updated_at: now,
+            },
+          }
         );
         return 'unknown';
       }
 
       const canRetry = err.retryable && nextAttempt < row.max_attempts;
       const backoffMs = Math.min(60_000, 5_000 * Math.pow(2, nextAttempt - 1));
-      await dbQuery(
-        `UPDATE applink_sms_outbox
-         SET status = 'failed',
-             attempts = $1,
-             provider_status_code = $2,
-             provider_status_detail = $3,
-             last_error = $4,
-             next_retry_at = $5,
-             updated_at = NOW()
-         WHERE id = $6`,
-        [
-          nextAttempt,
-          err.statusCode,
-          err.statusDetail,
-          err.message,
-          canRetry ? new Date(Date.now() + backoffMs).toISOString() : null,
-          row.id,
-        ]
+      await db.collection('applink_sms_outbox').updateOne(
+        { id: row.id },
+        {
+          $set: {
+            status: 'failed',
+            attempts: nextAttempt,
+            provider_status_code: err.statusCode,
+            provider_status_detail: err.statusDetail,
+            last_error: err.message,
+            next_retry_at: canRetry ? new Date(Date.now() + backoffMs).toISOString() : null,
+            updated_at: now,
+          },
+        }
       );
       return 'failed';
     }
 
-    await dbQuery(
-      `UPDATE applink_sms_outbox
-       SET status = 'failed',
-           attempts = $1,
-           last_error = $2,
-           updated_at = NOW()
-       WHERE id = $3`,
-      [nextAttempt, err instanceof Error ? err.message : 'Unknown error', row.id]
+    await db.collection('applink_sms_outbox').updateOne(
+      { id: row.id },
+      {
+        $set: {
+          status: 'failed',
+          attempts: nextAttempt,
+          last_error: err instanceof Error ? err.message : 'Unknown error',
+          updated_at: now,
+        },
+      }
     );
     return 'failed';
   }
 }
 
 export async function processPendingSmsOutbox(limit = 10): Promise<{ processed: number }> {
-  const res = await dbQuery<{ id: string }>(
-    `SELECT id FROM applink_sms_outbox
-     WHERE (status = 'queued' OR (status = 'failed' AND next_retry_at IS NOT NULL AND next_retry_at <= NOW()))
-       AND attempts < max_attempts
-     ORDER BY created_at ASC
-     LIMIT $1`,
-    [Math.max(1, Math.min(limit, 25))]
-  );
+  const db = await getDb();
+  const now = new Date().toISOString();
+  const rows = await db
+    .collection('applink_sms_outbox')
+    .find(
+      {
+        $expr: { $lt: ['$attempts', '$max_attempts'] },
+        $or: [
+          { status: 'queued' },
+          { status: 'failed', next_retry_at: { $ne: null, $lte: now } },
+        ],
+      },
+      { projection: { _id: 0, id: 1 } }
+    )
+    .sort({ created_at: 1 })
+    .limit(Math.max(1, Math.min(limit, 25)))
+    .toArray();
 
   let processed = 0;
-  for (const row of res.rows) {
-    await dispatchOutboxRow(row.id);
+  for (const row of rows) {
+    await dispatchOutboxRow(String(row.id));
     processed += 1;
   }
   return { processed };

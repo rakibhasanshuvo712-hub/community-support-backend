@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
-import { dbQuery, getPool } from '../../lib/db.js';
 import { AppError } from '../../lib/errors.js';
+import { getDb, newId } from '../../lib/mongo.js';
 import { assertNoSensitiveFinancialData, sanitizeText } from '../../lib/security.js';
 import { authenticate } from '../../middleware/auth.js';
 import { createClaimSchema } from '../../schemas/interactions.schema.js';
@@ -23,11 +23,8 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
       const body = createClaimSchema.parse(request.body);
       assertNoSensitiveFinancialData(body.message);
 
-      const postRes = await dbQuery<{ id: string; author_id: string; post_type: string; status: string; title: string }>(
-        'SELECT id, author_id, post_type, status, title FROM posts WHERE id = $1',
-        [postId]
-      );
-      const post = postRes.rows[0];
+      const db = await getDb();
+      const post = await db.collection('posts').findOne({ id: postId });
       if (!post) throw new AppError(404, 'NOT_FOUND', 'Post not found');
       if (post.author_id === userId) {
         throw new AppError(400, 'BAD_REQUEST', 'You cannot claim or offer on your own post');
@@ -36,35 +33,39 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, 'BAD_REQUEST', 'This post is no longer accepting offers or requests');
       }
 
-      const claimType = post.post_type === 'help_request' ? 'offer_to_donate' : 'request_item';
-
-      let claim;
-      try {
-        const res = await dbQuery(
-          `INSERT INTO claims (post_id, claimant_id, claim_type, message, quantity_offered, status)
-           VALUES ($1, $2, $3, $4, $5, 'pending')
-           RETURNING *`,
-          [
-            postId,
-            userId,
-            claimType,
-            body.message ? sanitizeText(body.message) : null,
-            body.quantity_offered ?? null,
-          ]
-        );
-        claim = res.rows[0];
-      } catch (err: unknown) {
-        if ((err as { code?: string }).code === '23505') {
-          throw new AppError(409, 'CONFLICT', 'You already have an active offer or request on this post');
-        }
-        throw err;
+      const duplicate = await db.collection('claims').findOne({
+        post_id: postId,
+        claimant_id: userId,
+        status: { $in: ['pending', 'accepted'] },
+      });
+      if (duplicate) {
+        throw new AppError(409, 'CONFLICT', 'You already have an active offer or request on this post');
       }
 
+      const claimType = post.post_type === 'help_request' ? 'offer_to_donate' : 'request_item';
+      const now = new Date().toISOString();
+      const claim = {
+        id: newId(),
+        post_id: postId,
+        post_author_id: String(post.author_id),
+        claimant_id: userId,
+        claim_type: claimType,
+        message: body.message ? sanitizeText(body.message) : null,
+        quantity_offered: body.quantity_offered ?? null,
+        status: 'pending',
+        donor_confirmed_handover: false,
+        recipient_confirmed_handover: false,
+        confirmed_at: null,
+        created_at: now,
+        updated_at: now,
+      };
+      await db.collection('claims').insertOne({ ...claim });
+
       await createNotification({
-        userId: post.author_id,
+        userId: String(post.author_id),
         type: claimType === 'offer_to_donate' ? 'new_offer' : 'new_request',
         title: claimType === 'offer_to_donate' ? 'New donation offer received' : 'New item request received',
-        body: `${request.authUser!.full_name} responded to "${post.title}".`,
+        body: `${request.authUser!.full_name} responded to "${String(post.title)}".`,
         link: `/posts/${postId}`,
       });
 
@@ -83,32 +84,38 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const [outRes, inRes] = await Promise.all([
-        dbQuery(
-          `SELECT c.*,
-                  json_build_object('id', p.id, 'title', p.title, 'post_type', p.post_type, 'donation_type', p.donation_type, 'status', p.status, 'location_city', p.location_city, 'author_id', p.author_id,
-                    'author', json_build_object('id', au.id, 'full_name', au.full_name)) AS post
-           FROM claims c
-           JOIN posts p ON p.id = c.post_id
-           JOIN profiles au ON au.id = p.author_id
-           WHERE c.claimant_id = $1
-           ORDER BY c.created_at DESC`,
-          [userId]
-        ),
-        dbQuery(
-          `SELECT c.*,
-                  json_build_object('id', cl.id, 'full_name', cl.full_name, 'location_city', cl.location_city) AS claimant,
-                  json_build_object('id', p.id, 'title', p.title, 'post_type', p.post_type, 'donation_type', p.donation_type, 'status', p.status) AS post
-           FROM claims c
-           JOIN posts p ON p.id = c.post_id
-           JOIN profiles cl ON cl.id = c.claimant_id
-           WHERE p.author_id = $1
-           ORDER BY c.created_at DESC`,
-          [userId]
-        ),
+      const db = await getDb();
+
+      const [outgoingDocs, incomingDocs] = await Promise.all([
+        db.collection('claims').find({ claimant_id: userId }, { projection: { _id: 0 } }).sort({ created_at: -1 }).toArray(),
+        db.collection('claims').find({ post_author_id: userId }, { projection: { _id: 0 } }).sort({ created_at: -1 }).toArray(),
       ]);
 
-      return { outgoing: outRes.rows, incoming: inRes.rows };
+      const hydrate = async (docs: Record<string, unknown>[]) =>
+        Promise.all(
+          docs.map(async (c) => {
+            const [post, claimant] = await Promise.all([
+              db.collection('posts').findOne({ id: String(c.post_id) }, { projection: { _id: 0 } }),
+              db.collection('profiles').findOne(
+                { id: String(c.claimant_id) },
+                { projection: { _id: 0, id: 1, full_name: 1, location_city: 1 } }
+              ),
+            ]);
+            const author = post
+              ? await db
+                  .collection('profiles')
+                  .findOne({ id: String(post.author_id) }, { projection: { _id: 0, id: 1, full_name: 1 } })
+              : null;
+            return {
+              ...c,
+              post: post ? { ...post, author } : null,
+              claimant,
+            };
+          })
+        );
+
+      const [outgoing, incoming] = await Promise.all([hydrate(outgoingDocs), hydrate(incomingDocs)]);
+      return { outgoing, incoming };
     }
   );
 
@@ -118,44 +125,29 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
       preHandler: [authenticate],
       schema: {
         tags: ['Claims'],
-        summary: 'Accept a pending offer or request (transactional)',
+        summary: 'Accept a pending offer or request (atomic)',
       },
     },
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
-      const client = await getPool().connect();
+      const db = await getDb();
 
-      let claim;
-      try {
-        await client.query('BEGIN');
-        const claimRes = await client.query('SELECT * FROM claims WHERE id = $1 FOR UPDATE', [id]);
-        if (!claimRes.rows[0]) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
+      const existing = await db.collection('claims').findOne({ id });
+      if (!existing) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
 
-        const postRes = await client.query('SELECT * FROM posts WHERE id = $1 FOR UPDATE', [claimRes.rows[0].post_id]);
-        if (!postRes.rows[0]) throw new AppError(404, 'NOT_FOUND', 'Post not found');
+      const post = await db.collection('posts').findOne({ id: String(existing.post_id) });
+      if (!post) throw new AppError(404, 'NOT_FOUND', 'Post not found');
+      if (post.author_id !== userId) throw new AppError(403, 'FORBIDDEN', 'Only the post owner can accept');
+      if (post.status !== 'active') throw new AppError(400, 'BAD_REQUEST', 'Post is not active');
 
-        if (postRes.rows[0].author_id !== userId) {
-          throw new AppError(403, 'FORBIDDEN', 'Only the post owner can accept');
-        }
-        if (postRes.rows[0].status !== 'active') {
-          throw new AppError(400, 'BAD_REQUEST', 'Post is not active');
-        }
-        if (claimRes.rows[0].status !== 'pending') {
-          throw new AppError(409, 'CONFLICT', 'Claim is no longer pending');
-        }
-
-        const updatedRes = await client.query(
-          `UPDATE claims SET status = 'accepted', updated_at = NOW() WHERE id = $1 RETURNING *`,
-          [id]
-        );
-        claim = updatedRes.rows[0];
-        await client.query('COMMIT');
-      } catch (err) {
-        await client.query('ROLLBACK');
-        throw err;
-      } finally {
-        client.release();
+      const claim = await db.collection('claims').findOneAndUpdate(
+        { id, status: 'pending' },
+        { $set: { status: 'accepted', updated_at: new Date().toISOString() } },
+        { returnDocument: 'after', projection: { _id: 0 } }
+      );
+      if (!claim) {
+        throw new AppError(409, 'CONFLICT', 'Claim is no longer pending');
       }
 
       await createNotification({
@@ -163,7 +155,7 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
         type: 'offer_accepted',
         title: 'Your offer/request was accepted!',
         body: 'You can now view handover details and coordinate directly.',
-        link: `/posts/${claim.post_id}`,
+        link: `/posts/${String(claim.post_id)}`,
       });
 
       const smsResult = await enqueueAndDispatchClaimAcceptedSms({
@@ -187,31 +179,33 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
+      const db = await getDb();
 
-      const res = await dbQuery<{ claimant_id: string; post_id: string; status: string; author_id: string; title: string }>(
-        `SELECT c.claimant_id, c.post_id, c.status, p.author_id, p.title
-         FROM claims c JOIN posts p ON p.id = c.post_id WHERE c.id = $1`,
-        [id]
-      );
-      const claim = res.rows[0];
-      if (!claim) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
-      if (claim.author_id !== userId) throw new AppError(403, 'FORBIDDEN', 'Only the post owner can reject');
-      if (claim.status !== 'pending') throw new AppError(409, 'CONFLICT', 'Only pending claims can be rejected');
+      const existing = await db.collection('claims').findOne({ id });
+      if (!existing) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
+      const post = await db.collection('posts').findOne({ id: String(existing.post_id) });
+      if (!post || post.author_id !== userId) {
+        throw new AppError(403, 'FORBIDDEN', 'Only the post owner can reject');
+      }
+      if (existing.status !== 'pending') {
+        throw new AppError(409, 'CONFLICT', 'Only pending claims can be rejected');
+      }
 
-      const updated = await dbQuery(
-        `UPDATE claims SET status = 'rejected', updated_at = NOW() WHERE id = $1 RETURNING *`,
-        [id]
+      const claim = await db.collection('claims').findOneAndUpdate(
+        { id, status: 'pending' },
+        { $set: { status: 'rejected', updated_at: new Date().toISOString() } },
+        { returnDocument: 'after', projection: { _id: 0 } }
       );
 
       await createNotification({
-        userId: claim.claimant_id,
+        userId: String(existing.claimant_id),
         type: 'offer_rejected',
         title: 'Offer/request update',
-        body: `Your response on "${claim.title}" was declined.`,
-        link: `/posts/${claim.post_id}`,
+        body: `Your response on "${String(post.title)}" was declined.`,
+        link: `/posts/${String(existing.post_id)}`,
       });
 
-      return { claim: updated.rows[0] };
+      return { claim };
     }
   );
 
@@ -227,20 +221,21 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
+      const db = await getDb();
 
-      const res = await dbQuery<{ claimant_id: string; status: string }>('SELECT claimant_id, status FROM claims WHERE id = $1', [id]);
-      const claim = res.rows[0];
-      if (!claim) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
-      if (claim.claimant_id !== userId) throw new AppError(403, 'FORBIDDEN', 'Only the claimant can cancel');
-      if (!['pending', 'accepted'].includes(claim.status)) {
+      const existing = await db.collection('claims').findOne({ id });
+      if (!existing) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
+      if (existing.claimant_id !== userId) throw new AppError(403, 'FORBIDDEN', 'Only the claimant can cancel');
+      if (!['pending', 'accepted'].includes(String(existing.status))) {
         throw new AppError(409, 'CONFLICT', 'This claim cannot be cancelled');
       }
 
-      const updated = await dbQuery(
-        `UPDATE claims SET status = 'cancelled', updated_at = NOW() WHERE id = $1 RETURNING *`,
-        [id]
+      const claim = await db.collection('claims').findOneAndUpdate(
+        { id },
+        { $set: { status: 'cancelled', updated_at: new Date().toISOString() } },
+        { returnDocument: 'after', projection: { _id: 0 } }
       );
-      return { claim: updated.rows[0] };
+      return { claim };
     }
   );
 
@@ -256,102 +251,69 @@ export async function claimRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const userId = request.authUser!.id;
-      const client = await getPool().connect();
+      const db = await getDb();
 
-      let updatedClaim;
-      let otherUserId: string;
-      let postTitle: string;
-      let postId: string;
-      let bothConfirmed = false;
-      let newlyConfirmed = false;
+      const claim = await db.collection('claims').findOne({ id }, { projection: { _id: 0 } });
+      if (!claim) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
 
-      try {
-        await client.query('BEGIN');
-        const res = await client.query<{
-          post_id: string;
-          claimant_id: string;
-          status: string;
-          donor_confirmed_handover: boolean;
-          recipient_confirmed_handover: boolean;
-          author_id: string;
-          post_type: string;
-          title: string;
-        }>(
-          `SELECT c.*, p.author_id, p.post_type, p.title
-           FROM claims c JOIN posts p ON p.id = c.post_id WHERE c.id = $1 FOR UPDATE OF c`,
-          [id]
-        );
-        const claim = res.rows[0];
-        if (!claim) throw new AppError(404, 'NOT_FOUND', 'Claim not found');
+      const post = await db.collection('posts').findOne({ id: String(claim.post_id) });
+      if (!post) throw new AppError(404, 'NOT_FOUND', 'Post not found');
 
-        const isOwner = claim.author_id === userId;
-        const isClaimant = claim.claimant_id === userId;
-        if (!isOwner && !isClaimant) {
-          throw new AppError(403, 'FORBIDDEN', 'You are not a participant in this claim');
-        }
-
-        if (claim.status === 'completed') {
-          await client.query('COMMIT');
-          return { claim };
-        }
-        if (claim.status !== 'accepted') {
-          throw new AppError(409, 'CONFLICT', 'Handover can only be confirmed for accepted claims');
-        }
-
-        const isUserDonor =
-          (claim.post_type === 'donation_offer' && isOwner) ||
-          (claim.post_type === 'help_request' && isClaimant);
-
-        const alreadyConfirmedByMe = isUserDonor
-          ? claim.donor_confirmed_handover
-          : claim.recipient_confirmed_handover;
-
-        if (alreadyConfirmedByMe) {
-          await client.query('COMMIT');
-          return { claim };
-        }
-
-        const nextDonor = isUserDonor ? true : claim.donor_confirmed_handover;
-        const nextRecipient = !isUserDonor ? true : claim.recipient_confirmed_handover;
-        bothConfirmed = nextDonor && nextRecipient;
-        newlyConfirmed = true;
-        otherUserId = isOwner ? claim.claimant_id : claim.author_id;
-        postTitle = claim.title;
-        postId = claim.post_id;
-
-        const updated = await client.query(
-          `UPDATE claims
-           SET donor_confirmed_handover = $1,
-               recipient_confirmed_handover = $2,
-               status = $3,
-               confirmed_at = $4,
-               updated_at = NOW()
-           WHERE id = $5
-           RETURNING *`,
-          [nextDonor, nextRecipient, bothConfirmed ? 'completed' : 'accepted', bothConfirmed ? new Date().toISOString() : null, id]
-        );
-        updatedClaim = updated.rows[0];
-        await client.query('COMMIT');
-      } catch (err) {
-        await client.query('ROLLBACK');
-        throw err;
-      } finally {
-        client.release();
+      const isOwner = post.author_id === userId;
+      const isClaimant = claim.claimant_id === userId;
+      if (!isOwner && !isClaimant) {
+        throw new AppError(403, 'FORBIDDEN', 'You are not a participant in this claim');
       }
 
-      if (newlyConfirmed) {
-        await createNotification({
-          userId: otherUserId!,
-          type: 'contribution_confirmed',
-          title: bothConfirmed ? 'Handover completed!' : 'Handover confirmation pending',
-          body: bothConfirmed
-            ? `Both parties confirmed the handover for "${postTitle!}".`
-            : `The other party confirmed handover for "${postTitle!}". Please confirm when ready.`,
-          link: `/posts/${postId!}`,
-        });
+      if (claim.status === 'completed') return { claim };
+      if (claim.status !== 'accepted') {
+        throw new AppError(409, 'CONFLICT', 'Handover can only be confirmed for accepted claims');
       }
 
-      return { claim: updatedClaim };
+      const isUserDonor =
+        (post.post_type === 'donation_offer' && isOwner) ||
+        (post.post_type === 'help_request' && isClaimant);
+
+      const alreadyConfirmed = isUserDonor
+        ? Boolean(claim.donor_confirmed_handover)
+        : Boolean(claim.recipient_confirmed_handover);
+      if (alreadyConfirmed) return { claim };
+
+      const flagField = isUserDonor ? 'donor_confirmed_handover' : 'recipient_confirmed_handover';
+      const now = new Date().toISOString();
+
+      let updated = await db.collection('claims').findOneAndUpdate(
+        { id, status: 'accepted' },
+        { $set: { [flagField]: true, updated_at: now } },
+        { returnDocument: 'after', projection: { _id: 0 } }
+      );
+
+      if (!updated) throw new AppError(409, 'CONFLICT', 'Claim state changed concurrently');
+
+      const bothConfirmed = Boolean(
+        updated.donor_confirmed_handover && updated.recipient_confirmed_handover
+      );
+      if (bothConfirmed) {
+        updated =
+          (await db.collection('claims').findOneAndUpdate(
+            { id, donor_confirmed_handover: true, recipient_confirmed_handover: true },
+            { $set: { status: 'completed', confirmed_at: now, updated_at: now } },
+            { returnDocument: 'after', projection: { _id: 0 } }
+          )) ?? updated;
+      }
+
+      const otherUserId = isOwner ? String(claim.claimant_id) : String(post.author_id);
+      await createNotification({
+        userId: otherUserId,
+        type: 'contribution_confirmed',
+        title: bothConfirmed ? 'Handover completed!' : 'Handover confirmation pending',
+        body: bothConfirmed
+          ? `Both parties confirmed the handover for "${String(post.title)}".`
+          : `The other party confirmed handover for "${String(post.title)}". Please confirm when ready.`,
+        link: `/posts/${String(claim.post_id)}`,
+      });
+
+      return { claim: updated };
     }
   );
 }

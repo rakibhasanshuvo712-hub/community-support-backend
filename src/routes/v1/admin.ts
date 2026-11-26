@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { dbQuery } from '../../lib/db.js';
+import { getDb, newId } from '../../lib/mongo.js';
 import { AppError } from '../../lib/errors.js';
 import { sanitizeText } from '../../lib/security.js';
 import { requireAdmin } from '../../middleware/auth.js';
@@ -22,21 +22,22 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
-      const [users, posts, claims, contributions, openReports] = await Promise.all([
-        dbQuery<{ count: string }>('SELECT COUNT(*)::text AS count FROM profiles'),
-        dbQuery<{ count: string }>('SELECT COUNT(*)::text AS count FROM posts'),
-        dbQuery<{ count: string }>('SELECT COUNT(*)::text AS count FROM claims'),
-        dbQuery<{ count: string }>('SELECT COUNT(*)::text AS count FROM contributions'),
-        dbQuery<{ count: string }>(`SELECT COUNT(*)::text AS count FROM reports WHERE status = 'open'`),
+      const db = await getDb();
+      const [total_users, total_posts, total_claims, total_contributions, open_reports] = await Promise.all([
+        db.collection('profiles').countDocuments(),
+        db.collection('posts').countDocuments(),
+        db.collection('claims').countDocuments(),
+        db.collection('contributions').countDocuments(),
+        db.collection('reports').countDocuments({ status: 'open' }),
       ]);
 
       return {
         stats: {
-          total_users: Number(users.rows[0]?.count ?? 0),
-          total_posts: Number(posts.rows[0]?.count ?? 0),
-          total_claims: Number(claims.rows[0]?.count ?? 0),
-          total_contributions: Number(contributions.rows[0]?.count ?? 0),
-          open_reports: Number(openReports.rows[0]?.count ?? 0),
+          total_users,
+          total_posts,
+          total_claims,
+          total_contributions,
+          open_reports,
         },
       };
     }
@@ -51,10 +52,14 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
-      const res = await dbQuery(
-        'SELECT id, full_name, role, is_suspended, suspended_reason, location_city, created_at FROM profiles ORDER BY created_at DESC LIMIT 100'
-      );
-      return { users: res.rows };
+      const db = await getDb();
+      const users = await db
+        .collection('profiles')
+        .find({}, { projection: { _id: 0, id: 1, full_name: 1, phone: 1, role: 1, is_suspended: 1, suspended_reason: 1, location_city: 1, created_at: 1 } })
+        .sort({ created_at: -1 })
+        .limit(100)
+        .toArray();
+      return { users };
     }
   );
 
@@ -75,24 +80,33 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, 'BAD_REQUEST', 'You cannot ban your own admin account');
       }
 
-      const res = await dbQuery(
-        `UPDATE profiles
-         SET is_suspended = $1,
-             suspended_reason = $2,
-             updated_at = NOW()
-         WHERE id = $3
-         RETURNING *`,
-        [body.is_suspended, body.is_suspended ? sanitizeText(body.reason) : null, id]
+      const db = await getDb();
+      const now = new Date().toISOString();
+      const user = await db.collection('profiles').findOneAndUpdate(
+        { id },
+        {
+          $set: {
+            is_suspended: body.is_suspended,
+            suspended_reason: body.is_suspended ? sanitizeText(body.reason) : null,
+            updated_at: now,
+          },
+        },
+        { returnDocument: 'after', projection: { _id: 0 } }
       );
-      if (!res.rows[0]) throw new AppError(404, 'NOT_FOUND', 'User not found');
+      if (!user) throw new AppError(404, 'NOT_FOUND', 'User not found');
 
-      await dbQuery(
-        `INSERT INTO moderation_actions (admin_id, action_type, target_user_id, reason)
-         VALUES ($1, $2, $3, $4)`,
-        [adminId, body.is_suspended ? 'suspend_user' : 'unsuspend_user', id, sanitizeText(body.reason)]
-      );
+      await db.collection('moderation_actions').insertOne({
+        id: newId(),
+        admin_id: adminId,
+        action_type: body.is_suspended ? 'suspend_user' : 'unsuspend_user',
+        target_user_id: id,
+        target_post_id: null,
+        report_id: null,
+        reason: sanitizeText(body.reason),
+        created_at: now,
+      });
 
-      return { user: res.rows[0] };
+      return { user };
     }
   );
 
@@ -105,15 +119,25 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
-      const res = await dbQuery(
-        `SELECT p.id, p.title, p.post_type, p.donation_type, p.status, p.urgency, p.location_city, p.created_at,
-                json_build_object('id', pr.id, 'full_name', pr.full_name, 'is_suspended', pr.is_suspended) AS author
-         FROM posts p
-         JOIN profiles pr ON pr.id = p.author_id
-         ORDER BY p.created_at DESC
-         LIMIT 100`
-      );
-      return { posts: res.rows };
+      const db = await getDb();
+      const postDocs = await db
+        .collection('posts')
+        .find({}, { projection: { _id: 0, id: 1, author_id: 1, title: 1, post_type: 1, donation_type: 1, status: 1, urgency: 1, location_city: 1, created_at: 1 } })
+        .sort({ created_at: -1 })
+        .limit(100)
+        .toArray();
+
+      const authorIds = [...new Set(postDocs.map((p) => String(p.author_id)))];
+      const authors = authorIds.length
+        ? await db.collection('profiles').find({ id: { $in: authorIds } }, { projection: { _id: 0, id: 1, full_name: 1, is_suspended: 1 } }).toArray()
+        : [];
+      const authorMap = new Map(authors.map((a) => [String(a.id), a]));
+
+      const posts = postDocs.map((p) => ({
+        ...p,
+        author: authorMap.get(String(p.author_id)) ?? null,
+      }));
+      return { posts };
     }
   );
 
@@ -130,21 +154,28 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       const adminId = request.authUser!.id;
       const body = adminPostStatusSchema.parse(request.body);
 
-      const res = await dbQuery<{ id: string; author_id: string; title: string; status: string }>(
-        'UPDATE posts SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
-        [body.status, id]
+      const db = await getDb();
+      const now = new Date().toISOString();
+      const updated = await db.collection('posts').findOneAndUpdate(
+        { id },
+        { $set: { status: body.status, updated_at: now } },
+        { returnDocument: 'after', projection: { _id: 0 } }
       );
-      const updated = res.rows[0];
       if (!updated) throw new AppError(404, 'NOT_FOUND', 'Post not found');
 
-      await dbQuery(
-        `INSERT INTO moderation_actions (admin_id, action_type, target_post_id, reason)
-         VALUES ($1, $2, $3, $4)`,
-        [adminId, body.status === 'removed' ? 'remove_post' : 'restore_post', id, sanitizeText(body.reason)]
-      );
+      await db.collection('moderation_actions').insertOne({
+        id: newId(),
+        admin_id: adminId,
+        action_type: body.status === 'removed' ? 'remove_post' : 'restore_post',
+        target_post_id: id,
+        target_user_id: null,
+        report_id: null,
+        reason: sanitizeText(body.reason),
+        created_at: now,
+      });
 
       await createNotification({
-        userId: updated.author_id,
+        userId: String(updated.author_id),
         type: 'moderation',
         title: 'Post moderation update',
         body: `Your post "${updated.title}" status was updated to ${body.status}: ${sanitizeText(body.reason)}`,
@@ -166,24 +197,34 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const { id } = request.params;
       const adminId = request.authUser!.id;
+      const db = await getDb();
 
-      const existingRes = await dbQuery<{ id: string; author_id: string; title: string }>(
-        'SELECT id, author_id, title FROM posts WHERE id = $1',
-        [id]
+      const existing = await db.collection('posts').findOne(
+        { id },
+        { projection: { _id: 0, id: 1, author_id: 1, title: 1 } }
       );
-      const existing = existingRes.rows[0];
       if (!existing) throw new AppError(404, 'NOT_FOUND', 'Post not found');
 
-      await dbQuery('DELETE FROM posts WHERE id = $1', [id]);
+      await Promise.all([
+        db.collection('posts').deleteOne({ id }),
+        db.collection('post_private_details').deleteMany({ post_id: id }),
+        db.collection('post_images').deleteMany({ post_id: id }),
+        db.collection('private_documents').deleteMany({ post_id: id }),
+      ]);
 
-      await dbQuery(
-        `INSERT INTO moderation_actions (admin_id, action_type, target_post_id, target_user_id, reason)
-         VALUES ($1, 'remove_post', $2, $3, $4)`,
-        [adminId, id, existing.author_id, `Deleted post "${existing.title}"`]
-      );
+      await db.collection('moderation_actions').insertOne({
+        id: newId(),
+        admin_id: adminId,
+        action_type: 'remove_post',
+        target_post_id: id,
+        target_user_id: existing.author_id,
+        report_id: null,
+        reason: `Deleted post "${existing.title}"`,
+        created_at: new Date().toISOString(),
+      });
 
       await createNotification({
-        userId: existing.author_id,
+        userId: String(existing.author_id),
         type: 'moderation',
         title: 'Post deleted by administrator',
         body: `Your post "${existing.title}" was deleted by an administrator.`,
@@ -202,19 +243,42 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
-      const res = await dbQuery(
-        `SELECT r.*,
-                rp.full_name AS reporter_name,
-                tu.full_name AS target_user_name,
-                p.title AS target_post_title
-         FROM reports r
-         LEFT JOIN profiles rp ON rp.id = r.reporter_id
-         LEFT JOIN profiles tu ON tu.id = r.target_user_id
-         LEFT JOIN posts p ON p.id = r.target_post_id
-         ORDER BY r.created_at DESC
-         LIMIT 100`
-      );
-      return { reports: res.rows };
+      const db = await getDb();
+      const reportDocs = await db
+        .collection('reports')
+        .find({}, { projection: { _id: 0 } })
+        .sort({ created_at: -1 })
+        .limit(100)
+        .toArray();
+
+      const userIds = [
+        ...new Set(
+          reportDocs
+            .flatMap((r) => [r.reporter_id, r.target_user_id])
+            .filter(Boolean)
+            .map(String)
+        ),
+      ];
+      const postIds = [...new Set(reportDocs.map((r) => r.target_post_id).filter(Boolean).map(String))];
+
+      const [users, posts] = await Promise.all([
+        userIds.length
+          ? db.collection('profiles').find({ id: { $in: userIds } }, { projection: { _id: 0, id: 1, full_name: 1 } }).toArray()
+          : Promise.resolve([]),
+        postIds.length
+          ? db.collection('posts').find({ id: { $in: postIds } }, { projection: { _id: 0, id: 1, title: 1 } }).toArray()
+          : Promise.resolve([]),
+      ]);
+      const userMap = new Map(users.map((u) => [String(u.id), u.full_name]));
+      const postMap = new Map(posts.map((p) => [String(p.id), p.title]));
+
+      const reports = reportDocs.map((r) => ({
+        ...r,
+        reporter_name: r.reporter_id ? userMap.get(String(r.reporter_id)) ?? null : null,
+        target_user_name: r.target_user_id ? userMap.get(String(r.target_user_id)) ?? null : null,
+        target_post_title: r.target_post_id ? postMap.get(String(r.target_post_id)) ?? null : null,
+      }));
+      return { reports };
     }
   );
 
@@ -230,29 +294,37 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       const { id } = request.params;
       const adminId = request.authUser!.id;
       const body = adminResolveReportSchema.parse(request.body);
+      const db = await getDb();
+      const now = new Date().toISOString();
 
-      const res = await dbQuery<{ id: string; reporter_id: string; reason: string; status: string }>(
-        `UPDATE reports
-         SET status = $1,
-             resolution_note = $2,
-             resolved_by = $3,
-             resolved_at = CASE WHEN $1 = 'reviewing' THEN NULL ELSE NOW() END
-         WHERE id = $4
-         RETURNING *`,
-        [body.status, sanitizeText(body.reason), adminId, id]
+      const updated = await db.collection('reports').findOneAndUpdate(
+        { id },
+        {
+          $set: {
+            status: body.status,
+            resolution_note: sanitizeText(body.reason),
+            resolved_by: adminId,
+            resolved_at: body.status === 'reviewing' ? null : now,
+          },
+        },
+        { returnDocument: 'after', projection: { _id: 0 } }
       );
-      const updated = res.rows[0];
       if (!updated) throw new AppError(404, 'NOT_FOUND', 'Report not found');
 
       if (body.status === 'resolved' || body.status === 'dismissed') {
-        await dbQuery(
-          `INSERT INTO moderation_actions (admin_id, action_type, report_id, reason)
-           VALUES ($1, $2, $3, $4)`,
-          [adminId, body.status === 'resolved' ? 'resolve_report' : 'dismiss_report', id, sanitizeText(body.reason)]
-        );
+        await db.collection('moderation_actions').insertOne({
+          id: newId(),
+          admin_id: adminId,
+          action_type: body.status === 'resolved' ? 'resolve_report' : 'dismiss_report',
+          report_id: id,
+          target_user_id: null,
+          target_post_id: null,
+          reason: sanitizeText(body.reason),
+          created_at: now,
+        });
 
         await createNotification({
-          userId: updated.reporter_id,
+          userId: String(updated.reporter_id),
           type: 'moderation',
           title: `Dispute ${body.status}`,
           body: `Your complaint ("${updated.reason}") was marked ${body.status}: ${sanitizeText(body.reason)}`,
@@ -273,8 +345,14 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async () => {
-      const res = await dbQuery('SELECT * FROM moderation_actions ORDER BY created_at DESC LIMIT 50');
-      return { actions: res.rows };
+      const db = await getDb();
+      const actions = await db
+        .collection('moderation_actions')
+        .find({}, { projection: { _id: 0 } })
+        .sort({ created_at: -1 })
+        .limit(50)
+        .toArray();
+      return { actions };
     }
   );
 }

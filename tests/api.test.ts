@@ -3,13 +3,34 @@ import { buildApp } from '../src/app.js';
 import { assertNoSensitiveFinancialData, sanitizeText } from '../src/lib/security.js';
 import { AppError } from '../src/lib/errors.js';
 
-vi.mock('../src/lib/db.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../src/lib/db.js')>();
+vi.mock('../src/lib/mongo.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/lib/mongo.js')>();
+  const mockCursor = () => ({
+    sort: () => mockCursor(),
+    limit: () => mockCursor(),
+    skip: () => mockCursor(),
+    toArray: vi.fn().mockResolvedValue([]),
+  });
+  const mockCollection = () => ({
+    find: () => mockCursor(),
+    findOne: vi.fn().mockResolvedValue(null),
+    findOneAndUpdate: vi.fn().mockResolvedValue(null),
+    insertOne: vi.fn().mockResolvedValue({ acknowledged: true }),
+    insertMany: vi.fn().mockResolvedValue({ acknowledged: true }),
+    updateOne: vi.fn().mockResolvedValue({ acknowledged: true }),
+    updateMany: vi.fn().mockResolvedValue({ acknowledged: true }),
+    deleteOne: vi.fn().mockResolvedValue({ acknowledged: true }),
+    deleteMany: vi.fn().mockResolvedValue({ acknowledged: true }),
+    countDocuments: vi.fn().mockResolvedValue(0),
+    createIndex: vi.fn().mockResolvedValue('ok'),
+  });
+  const mockDb = {
+    collection: vi.fn().mockImplementation(() => mockCollection()),
+    command: vi.fn().mockResolvedValue({ ok: 1 }),
+  };
   return {
     ...actual,
-    dbQuery: vi.fn().mockResolvedValue({ rows: [] }),
-    getPool: vi.fn(),
-    ensureSchemaMigrated: vi.fn().mockResolvedValue(undefined),
+    getDb: vi.fn().mockResolvedValue(mockDb),
   };
 });
 
@@ -32,13 +53,13 @@ describe('API Endpoints & Authorization', () => {
     vi.clearAllMocks();
   });
 
-  it('GET /api/v1/health returns 200 ok with neon-postgres provider', async () => {
+  it('GET /api/v1/health returns 200 ok with mongodb provider', async () => {
     const app = await buildApp();
     const res = await app.inject({ method: 'GET', url: '/api/v1/health' });
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.status).toBe('ok');
-    expect(body.provider).toBe('neon-postgres');
+    expect(body.provider).toBe('mongodb');
   });
 
   it('GET /api/v1/categories returns default categories', async () => {

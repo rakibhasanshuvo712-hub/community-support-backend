@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { dbQuery } from '../../lib/db.js';
+import { getDb, newId } from '../../lib/mongo.js';
 import { AppError } from '../../lib/errors.js';
 import { sanitizeText } from '../../lib/security.js';
 import { authenticate } from '../../middleware/auth.js';
@@ -29,24 +29,26 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, 'BAD_REQUEST', 'You cannot file a complaint against your own account');
       }
 
-      const res = await dbQuery(
-        `INSERT INTO reports (
-          reporter_id, target_type, target_post_id, target_user_id, claim_id, contribution_id, reason, details, status
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'open')
-        RETURNING *`,
-        [
-          userId,
-          body.target_type,
-          body.target_post_id ?? null,
-          body.target_user_id ?? null,
-          body.claim_id ?? null,
-          body.contribution_id ?? null,
-          sanitizeText(body.reason),
-          body.details ? sanitizeText(body.details) : null,
-        ]
-      );
+      const db = await getDb();
+      const doc = {
+        id: newId(),
+        reporter_id: userId,
+        target_type: body.target_type,
+        target_post_id: body.target_post_id ?? null,
+        target_user_id: body.target_user_id ?? null,
+        claim_id: body.claim_id ?? null,
+        contribution_id: body.contribution_id ?? null,
+        reason: sanitizeText(body.reason),
+        details: body.details ? sanitizeText(body.details) : null,
+        status: 'open',
+        resolution_note: null,
+        resolved_by: null,
+        resolved_at: null,
+        created_at: new Date().toISOString(),
+      };
+      await db.collection('reports').insertOne({ ...doc });
 
-      return reply.status(201).send({ report: res.rows[0] });
+      return reply.status(201).send({ report: doc });
     }
   );
 
@@ -61,18 +63,33 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const res = await dbQuery(
-        `SELECT r.*,
-                tu.full_name AS target_user_name,
-                p.title AS target_post_title
-         FROM reports r
-         LEFT JOIN profiles tu ON tu.id = r.target_user_id
-         LEFT JOIN posts p ON p.id = r.target_post_id
-         WHERE r.reporter_id = $1
-         ORDER BY r.created_at DESC`,
-        [userId]
-      );
-      return { reports: res.rows };
+      const db = await getDb();
+      const docs = await db
+        .collection('reports')
+        .find({ reporter_id: userId }, { projection: { _id: 0 } })
+        .sort({ created_at: -1 })
+        .toArray();
+
+      const targetUserIds = [...new Set(docs.map((r) => r.target_user_id).filter(Boolean).map(String))];
+      const targetPostIds = [...new Set(docs.map((r) => r.target_post_id).filter(Boolean).map(String))];
+
+      const [users, posts] = await Promise.all([
+        targetUserIds.length
+          ? db.collection('profiles').find({ id: { $in: targetUserIds } }, { projection: { _id: 0, id: 1, full_name: 1 } }).toArray()
+          : Promise.resolve([]),
+        targetPostIds.length
+          ? db.collection('posts').find({ id: { $in: targetPostIds } }, { projection: { _id: 0, id: 1, title: 1 } }).toArray()
+          : Promise.resolve([]),
+      ]);
+      const userMap = new Map(users.map((u) => [String(u.id), u.full_name]));
+      const postMap = new Map(posts.map((p) => [String(p.id), p.title]));
+
+      const reports = docs.map((r) => ({
+        ...r,
+        target_user_name: r.target_user_id ? userMap.get(String(r.target_user_id)) ?? null : null,
+        target_post_title: r.target_post_id ? postMap.get(String(r.target_post_id)) ?? null : null,
+      }));
+      return { reports };
     }
   );
 }
