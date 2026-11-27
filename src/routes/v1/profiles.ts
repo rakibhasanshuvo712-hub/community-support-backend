@@ -50,12 +50,56 @@ export async function profileRoutes(app: FastifyInstance): Promise<void> {
         ? `${baseUrl}/api/v1/files/${String(profile.avatar_file_id)}`
         : null;
 
+      const rawPosts = await db
+        .collection('posts')
+        .find(
+          { author_id: id, status: { $in: ['active', 'fulfilled'] } },
+          { projection: { _id: 0 } }
+        )
+        .sort({ created_at: -1 })
+        .limit(20)
+        .toArray();
+
+      const [cats, images] = rawPosts.length
+        ? await Promise.all([
+            db.collection('categories').find({}, { projection: { _id: 0 } }).toArray(),
+            db
+              .collection('post_images')
+              .find(
+                { post_id: { $in: rawPosts.map((p) => String(p.id)) } },
+                { projection: { _id: 0 } }
+              )
+              .sort({ sort_order: 1 })
+              .toArray(),
+          ])
+        : [[], []];
+
+      const catMap = new Map(cats.map((c) => [String(c.id), c]));
+      const publicPosts = rawPosts.map((post) => ({
+        ...post,
+        author: {
+          id: profile.id,
+          full_name: profile.full_name,
+          avatar_signed_url: avatarSignedUrl,
+          location_city: profile.location_city ?? null,
+        },
+        category: catMap.get(String(post.category_id)) ?? null,
+        images: images
+          .filter((img) => img.post_id === post.id)
+          .map((img) => ({
+            id: img.id,
+            sort_order: img.sort_order,
+            url: `${baseUrl}/api/v1/files/${String(img.file_id)}`,
+          })),
+      }));
+
       return {
         profile: {
           ...profile,
           avatar_signed_url: avatarSignedUrl,
           public_posts_count: publicPostsCount,
         },
+        public_posts: publicPosts,
       };
     }
   );

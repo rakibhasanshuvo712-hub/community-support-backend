@@ -101,7 +101,7 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
           .collection('profiles')
           .find(
             { id: { $in: paged.map((p) => String(p.author_id)) } },
-            { projection: { _id: 0, id: 1, full_name: 1, location_city: 1 } }
+            { projection: { _id: 0, id: 1, full_name: 1, location_city: 1, avatar_file_id: 1 } }
           )
           .toArray(),
         db
@@ -115,8 +115,20 @@ export async function postRoutes(app: FastifyInstance): Promise<void> {
       ]);
 
       const catMap = new Map(cats.map((c) => [String(c.id), c]));
-      const profMap = new Map(profiles.map((p) => [String(p.id), p]));
       const baseUrl = `${request.protocol}://${request.headers.host}`;
+      const profMap = new Map(
+        profiles.map((p) => [
+          String(p.id),
+          {
+            id: p.id,
+            full_name: p.full_name,
+            location_city: p.location_city ?? null,
+            avatar_signed_url: p.avatar_file_id
+              ? `${baseUrl}/api/v1/files/${String(p.avatar_file_id)}`
+              : null,
+          },
+        ])
+      );
 
       const posts = paged.map((post) => {
         const postImgs = images
